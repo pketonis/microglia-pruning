@@ -210,6 +210,10 @@ class MicrogliaPruningSystem:
         self.logger.info("Starting Training")
         self.logger.info("="*60)
         
+        # Ensure base model doesn't store gradients to save memory
+        # We only optimize the pruning agents
+        self.model.requires_grad_(False)
+
         # Apply LoRA first if requested (before wrapping)
         if use_lora and not self.lora_applied:
             self._apply_lora()
@@ -218,6 +222,9 @@ class MicrogliaPruningSystem:
         if not self.wrapped:
             self._wrap_attention_layers()
         
+        # Ensure agents are trainable (in case they were frozen by self.model.requires_grad_)
+        self.agents.requires_grad_(True)
+
         # Enable pruning for training
         self._enable_pruning(True)
         
