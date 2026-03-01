@@ -78,14 +78,25 @@ class MicrogliaPruningSystem:
                     elif config.rope_scaling.get('type') not in ['linear', 'dynamic', 'longrope']:
                         config.rope_scaling = None
             
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                config=config,
-                device_map="auto",
-                torch_dtype=torch.bfloat16,
-                attn_implementation="eager",
-                trust_remote_code=True
-            )
+            # On CPU or macOS, avoid device_map="auto" (MPS can raise "Placeholder storage has not been allocated on MPS device")
+            if device == "cpu" or (device == "cuda" and not torch.cuda.is_available()):
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    config=config,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation="eager",
+                    trust_remote_code=True,
+                )
+                self.model = self.model.to(device)
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    config=config,
+                    device_map="auto",
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation="eager",
+                    trust_remote_code=True,
+                )
             
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
             
@@ -486,7 +497,7 @@ class MicrogliaPruningSystem:
         self.logger.info("Training Complete!")
         self.logger.info("="*60)
     
-    def generate(self, prompt: str, max_new_tokens: int = 256, use_pruning: bool = None, budget_keep_ratio: Optional[float] = None, **kwargs):
+    def generate(self, prompt: str, max_new_tokens: int = 128, use_pruning: bool = None, budget_keep_ratio: Optional[float] = None, **kwargs):
         """Generate text with optional pruning."""
         if self.tokenizer is None:
             raise ValueError("No tokenizer available")
@@ -514,7 +525,7 @@ class MicrogliaPruningSystem:
                 do_sample=False,
                 temperature=None,  # Disable temperature for greedy
                 top_p=None,
-                use_cache=False,
+                use_cache=True,
                 pad_token_id=self.model.config.pad_token_id,
                 eos_token_id=self.model.config.eos_token_id,
                 **kwargs
@@ -544,7 +555,8 @@ class MicrogliaPruningSystem:
     def evaluate(self,
                  dataset_name: str = "gsm8k",
                  split: str = "test",
-                 max_samples: int = 200,
+                 max_samples: int = 100,
+                 max_new_tokens: int = 128,
                  use_pruning: bool = True,
                  num_bootstrap: int = 1000) -> Dict:
         """Evaluate accuracy on a reasoning benchmark with bootstrap confidence intervals.
@@ -553,6 +565,7 @@ class MicrogliaPruningSystem:
             dataset_name: Name of the dataset to evaluate on.
             split: Dataset split to use.
             max_samples: Maximum number of samples to evaluate.
+            max_new_tokens: Maximum new tokens per generation (shorter = faster eval).
             use_pruning: Whether to enable pruning during evaluation.
             num_bootstrap: Number of bootstrap resamples for CI calculation.
 
@@ -577,7 +590,7 @@ class MicrogliaPruningSystem:
         with torch.no_grad():
             for example in progress_bar:
                 prompt = f"Question: {example['question']}\nAnswer:"
-                output = self.generate(prompt, max_new_tokens=256)
+                output = self.generate(prompt, max_new_tokens=max_new_tokens)
                 
                 gold_answer = self._extract_answer(example['answer'])
                 pred_answer = self._extract_answer(output)

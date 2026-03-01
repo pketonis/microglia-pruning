@@ -64,8 +64,34 @@ def main():
         action="store_true",
         help="Disable pruning for evaluation (baseline)"
     )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Max evaluation samples (default: 100; use with --fast for 50)"
+    )
+    parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=None,
+        help="Max new tokens per generation (default: 128; use with --fast for 64)"
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Fast eval for debugging: max_samples=50, max_new_tokens=64"
+    )
     
     args = parser.parse_args()
+    
+    if args.fast:
+        args.max_samples = args.max_samples if args.max_samples is not None else 50
+        args.max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else 64
+        print("Fast mode: max_samples=50, max_new_tokens=64")
+    if args.max_samples is None:
+        args.max_samples = 100
+    if args.max_new_tokens is None:
+        args.max_new_tokens = 128
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -98,6 +124,8 @@ def main():
     metrics = system.evaluate(
         dataset_name=args.dataset,
         split=args.split,
+        max_samples=args.max_samples,
+        max_new_tokens=args.max_new_tokens,
         use_pruning=not args.no_pruning
     )
     

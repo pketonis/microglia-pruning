@@ -16,7 +16,6 @@ dependencies = [
   "torch==2.3.1",
   "transformers==4.42.4",
   "accelerate==0.33.0",
-  "bitsandbytes==0.43.1",
   "peft==0.11.1",
   "datasets==2.20.0",
   "scipy==1.13.1",
@@ -36,6 +35,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Linux/CUDA only: bitsandbytes has no macOS ARM wheels
+cuda = ["bitsandbytes==0.43.1"]
 dev = [
   "pytest==8.2.2",
   "black==24.4.2",

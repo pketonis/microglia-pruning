@@ -78,6 +78,17 @@ For development tools (pytest, black, mypy, flake8):
 pip install -e .[dev]
 ```
 
+**With uv** (Python 3.10–3.12; 3.14 not yet supported by PyTorch):
+
+```bash
+cd microglia-pruning
+uv venv --python 3.12   # or 3.11 if 3.12 not installed
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+uv pip install -e .
+```
+
+On Linux/CUDA you can add optional quantization support: `uv pip install -e ".[cuda]"`. On macOS, `bitsandbytes` is omitted (no ARM wheels).
+
 ### Run Experiments in Colab
 
 We provide three interactive notebooks:

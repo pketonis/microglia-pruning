@@ -121,8 +121,18 @@ def main():
         default="microglia-pruning",
         help="W&B project name"
     )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Fast run for debugging: 2 epochs, 10 steps/epoch (short end-to-end validation)"
+    )
     
     args = parser.parse_args()
+    
+    if args.fast:
+        args.num_epochs = 2
+        args.max_steps_per_epoch = 10
+        print("Fast mode: num_epochs=2, max_steps_per_epoch=10")
     
     # Set seed for reproducibility
     set_seed(42)
