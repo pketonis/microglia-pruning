@@ -493,3 +493,37 @@ python scripts/perf_benchmark.py --model gpt2 --backend vllm --requests 20
 ```
 
 See `deployment.md` for production deployment guidance and benchmark templates.
+
+
+## Research-Grade Extensions
+
+### 1) Per-input dynamic pruning budgets
+`MicrogliaPruningSystem.generate()` now supports per-input budgets (`budget_keep_ratio`) and defaults to an automatic complexity-aware budget controller (`DynamicPruningBudget`).
+
+### 2) Multi-model support
+The project now includes a model registry with built-in aliases for:
+- `phi3-mini`
+- `llama3-8b` (Meta-Llama-3-8B-Instruct)
+- `mistral-7b` (Mistral-7B-Instruct-v0.2)
+
+### 3) Pareto frontier exploration
+Use the script below to sweep pruning budgets and extract the non-dominated frontier:
+
+```bash
+python scripts/pareto_explorer.py   --model_path checkpoints/pruning_system.pt   --base_model phi3-mini   --dataset gsm8k   --budgets 0.35 0.45 0.55 0.65 0.75 0.85 0.95   --output_dir results/
+```
+
+### 4) Theoretical analysis (lottery ticket connection)
+A dedicated script computes overlap-based sparse subnetwork stability metrics:
+
+```bash
+python scripts/theoretical_analysis.py   --mask_file results/mask_trajectory.npy   --output_dir results/
+```
+
+### 5) Interactive visualization dashboard
+Launch the dashboard to inspect benchmark and Pareto results:
+
+```bash
+streamlit run scripts/interactive_dashboard.py
+```
+

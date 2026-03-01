@@ -33,6 +33,27 @@ class PrunedAttention(nn.Module):
         self.last_masks: Optional[torch.Tensor] = None
         self.last_stats: Optional[torch.Tensor] = None
         self.enable_pruning: bool = False
+        self.budget_keep_ratio: Optional[float] = None
+
+    def set_budget_keep_ratio(self, keep_ratio: Optional[float]) -> None:
+        """Set per-input keep ratio budget for this layer."""
+        self.budget_keep_ratio = keep_ratio
+
+    def _apply_budget(self, masks: torch.Tensor) -> torch.Tensor:
+        """Project soft masks onto a fixed top-k support when budget is set."""
+        if self.budget_keep_ratio is None:
+            return masks
+
+        keep_ratio = float(max(0.0, min(1.0, self.budget_keep_ratio)))
+        num_heads = masks.shape[1]
+        keep_k = max(1, int(round(keep_ratio * num_heads)))
+        if keep_k >= num_heads:
+            return masks
+
+        topk_indices = masks.topk(k=keep_k, dim=1).indices
+        budget_mask = torch.zeros_like(masks)
+        budget_mask.scatter_(1, topk_indices, 1.0)
+        return masks * budget_mask
         
     def forward(self, 
                 hidden_states: torch.Tensor,
@@ -100,6 +121,8 @@ class PrunedAttention(nn.Module):
                 # Apply hard threshold in eval mode
                 if self.hard_prune and not self.training:
                     masks = (masks > 0.5).float()
+
+                masks = self._apply_budget(masks)
                 
                 # Store for monitoring
                 self.last_masks = masks.detach()

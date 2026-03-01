@@ -6,6 +6,9 @@ from .pruned_attention import PrunedAttention
 from .statistics import compute_layer_stats
 from .loss import compute_pruning_loss
 from .system import MicrogliaPruningSystem
+from .budget import DynamicPruningBudget
+from .pareto import ParetoPoint, ParetoResult, compute_pareto_frontier
+from .theory import LotteryTicketAnalysis, analyze_lottery_ticket_behavior
 from .inference import InferenceEngine, GenerationConfig
 from .export import export_to_onnx
 
@@ -19,6 +22,12 @@ __all__ = [
     "compute_layer_stats",
     "compute_pruning_loss",
     "MicrogliaPruningSystem",
+    "DynamicPruningBudget",
+    "ParetoPoint",
+    "ParetoResult",
+    "compute_pareto_frontier",
+    "LotteryTicketAnalysis",
+    "analyze_lottery_ticket_behavior",
     "InferenceEngine",
     "GenerationConfig",
     "export_to_onnx",
