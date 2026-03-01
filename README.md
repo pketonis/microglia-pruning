@@ -54,10 +54,28 @@ for layer in model.layers:
 ```bash
 git clone https://github.com/Tommaso-R-Marena/microglia-pruning.git
 cd microglia-pruning
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ## Quick Start
+
+
+### Reproducible Environment
+
+This repository now includes a **fully pinned** `pyproject.toml` to guarantee reproducible dependency resolution across machines and CI.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -e .
+```
+
+For development tools (pytest, black, mypy, flake8):
+
+```bash
+pip install -e .[dev]
+```
 
 ### Run Experiments in Colab
 
@@ -160,6 +178,46 @@ Measures efficiency metrics:
 - **Memory**: GPU memory usage
 - **Sparsity**: Percentage of heads pruned
 
+
+
+### 4. Comprehensive Benchmark Suite (GSM8K / MATH / BIG-Bench)
+
+```bash
+python scripts/benchmark_suite.py \
+  --model_path checkpoints/pruning_system.pt \
+  --datasets gsm8k math bigbench \
+  --max_examples 200 \
+  --output_dir results/
+```
+
+Outputs include:
+- Baseline vs pruned accuracies for each benchmark
+- Bootstrap 95% CIs for both conditions
+- Paired bootstrap significance test with effect size and p-value
+
+Optional W&B tracking:
+
+```bash
+python scripts/benchmark_suite.py \
+  --model_path checkpoints/pruning_system.pt \
+  --wandb --wandb_project microglia-pruning
+```
+
+### 5. Automated Ablation Framework
+
+```bash
+python scripts/ablation_study.py \
+  --model_path checkpoints/pruning_system.pt \
+  --dataset gsm8k \
+  --seeds 42 43 44 \
+  --hidden_dims 64 128 \
+  --temperatures 0.7 1.0 1.3 \
+  --hard_prune 0 1 \
+  --output_dir results/
+```
+
+This runs a full parameter grid and logs each run (plus aggregate bootstrap CIs) to JSON and optionally to W&B.
+
 ### Running Tests
 
 ```bash
@@ -182,11 +240,16 @@ microglia-pruning/
 │   ├── pruned_attention.py   # Attention wrapper with masking
 │   ├── statistics.py         # Activation statistics (norms, entropy)
 │   ├── loss.py               # Training loss (task + sparsity + entropy)
-│   └── system.py             # Main orchestration class
+│   ├── system.py             # Main orchestration class
+│   └── rigor/                # Experimental rigor utilities
+│       ├── statistics.py     # Bootstrap CIs and significance tests
+│       └── tracking.py       # Weights & Biases experiment tracking
 ├── scripts/
 │   ├── train.py              # Training pipeline
 │   ├── evaluate.py           # Accuracy evaluation
-│   └── benchmark.py          # Efficiency measurements
+│   ├── benchmark.py          # Efficiency measurements
+│   ├── benchmark_suite.py    # Rigorous GSM8K/MATH/BIG-Bench benchmarking
+│   └── ablation_study.py     # Automated ablation runner
 ├── notebooks/
 │   ├── microglia_pruning_demo.ipynb      # Quick demo (20-30 min)
 │   └── rigorous_experiment.ipynb         # Full evaluation (2-3 hours)
@@ -194,6 +257,7 @@ microglia-pruning/
 │   ├── test_agent.py
 │   ├── test_hooks.py
 │   └── test_pruned_attention.py
+├── pyproject.toml            # Fully pinned dependencies for reproducibility
 ├── requirements.txt
 └── README.md
 ```
