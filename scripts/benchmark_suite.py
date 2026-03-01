@@ -11,6 +11,7 @@ from typing import Dict, List, Tuple
 
 from datasets import load_dataset
 
+from src.model_registry import resolve_model_spec
 from src.rigor.statistics import bootstrap_ci, paired_bootstrap_test
 from src.rigor.tracking import ExperimentTracker
 from src.system import MicrogliaPruningSystem
@@ -44,6 +45,7 @@ DATASET_CONFIGS: Dict[str, Dict[str, str]] = {
 
 @dataclass
 class EvalRun:
+    model: str
     dataset: str
     seed: int
     mode: str
@@ -75,6 +77,7 @@ def _normalize(text: str) -> str:
 
 def evaluate_dataset(
     system: MicrogliaPruningSystem,
+    model_name: str,
     dataset_key: str,
     max_examples: int,
     use_pruning: bool,
@@ -97,6 +100,7 @@ def evaluate_dataset(
 
     accuracy = sum(outcomes) / max(len(outcomes), 1)
     run = EvalRun(
+        model=model_name,
         dataset=dataset_key,
         seed=0,
         mode="pruned" if use_pruning else "baseline",
@@ -111,7 +115,7 @@ def evaluate_dataset(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run rigorous benchmark suite.")
     parser.add_argument("--model_path", required=True, type=str)
-    parser.add_argument("--base_model", default="microsoft/phi-3-mini-4k-instruct")
+    parser.add_argument("--base_models", nargs="+", default=["phi3-mini", "llama3-8b", "mistral-7b"])
     parser.add_argument("--datasets", nargs="+", default=["gsm8k", "math", "bigbench"])
     parser.add_argument("--max_examples", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
@@ -132,38 +136,41 @@ def main() -> None:
         config=vars(args),
     )
 
-    system = MicrogliaPruningSystem(model=args.base_model)
-    system.load(args.model_path)
-
     summary = {"runs": [], "statistics": []}
 
-    for dataset_key in args.datasets:
-        base_outcomes, base_run = evaluate_dataset(system, dataset_key, args.max_examples, use_pruning=False)
-        pruned_outcomes, pruned_run = evaluate_dataset(system, dataset_key, args.max_examples, use_pruning=True)
+    for model_key in args.base_models:
+        resolved = resolve_model_spec(model_key)
+        system = MicrogliaPruningSystem(model=resolved.name)
+        system.load(args.model_path)
 
-        sig = paired_bootstrap_test(base_outcomes, pruned_outcomes, metric_name=f"{dataset_key}_accuracy")
-        base_ci = bootstrap_ci(base_outcomes)
-        pruned_ci = bootstrap_ci(pruned_outcomes)
+        for dataset_key in args.datasets:
+            base_outcomes, base_run = evaluate_dataset(system, resolved.name, dataset_key, args.max_examples, use_pruning=False)
+            pruned_outcomes, pruned_run = evaluate_dataset(system, resolved.name, dataset_key, args.max_examples, use_pruning=True)
 
-        summary["runs"].append(asdict(base_run))
-        summary["runs"].append(asdict(pruned_run))
-        summary["statistics"].append(
-            {
-                "dataset": dataset_key,
-                "baseline_ci": base_ci,
-                "pruned_ci": pruned_ci,
-                "effect": asdict(sig),
-            }
-        )
+            sig = paired_bootstrap_test(base_outcomes, pruned_outcomes, metric_name=f"{dataset_key}_accuracy")
+            base_ci = bootstrap_ci(base_outcomes)
+            pruned_ci = bootstrap_ci(pruned_outcomes)
 
-        tracker.log(
-            {
-                f"{dataset_key}/baseline_accuracy": base_run.accuracy,
-                f"{dataset_key}/pruned_accuracy": pruned_run.accuracy,
-                f"{dataset_key}/effect": sig.effect_size,
-                f"{dataset_key}/p_value": sig.p_value,
-            }
-        )
+            summary["runs"].append(asdict(base_run))
+            summary["runs"].append(asdict(pruned_run))
+            summary["statistics"].append(
+                {
+                    "model": resolved.name,
+                    "dataset": dataset_key,
+                    "baseline_ci": base_ci,
+                    "pruned_ci": pruned_ci,
+                    "effect": asdict(sig),
+                }
+            )
+
+            tracker.log(
+                {
+                    f"{resolved.name}/{dataset_key}/baseline_accuracy": base_run.accuracy,
+                    f"{resolved.name}/{dataset_key}/pruned_accuracy": pruned_run.accuracy,
+                    f"{resolved.name}/{dataset_key}/effect": sig.effect_size,
+                    f"{resolved.name}/{dataset_key}/p_value": sig.p_value,
+                }
+            )
 
     out_file = os.path.join(args.output_dir, "benchmark_suite_results.json")
     with open(out_file, "w", encoding="utf-8") as f:

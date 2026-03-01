@@ -17,6 +17,8 @@ from .hooks import register_hooks, remove_hooks
 from .pruned_attention import PrunedAttention
 from .loss import compute_pruning_loss, get_alpha_schedule, compute_efficiency_metrics
 from .utils import get_model_layers, setup_logging
+from .budget import DynamicPruningBudget
+from .model_registry import resolve_model_spec
 
 
 class MicrogliaPruningSystem:
@@ -53,10 +55,13 @@ class MicrogliaPruningSystem:
         
         self.logger.info(f"Initializing MicrogliaPruningSystem on {device}...")
         
+        resolved_spec = resolve_model_spec(model if isinstance(model, str) else "custom")
+
         if isinstance(model, str):
+            model_name = resolved_spec.name
             self.logger.info(f"Loading base model: {model}")
             
-            config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+            config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
             
             # Fix rope_scaling
             if hasattr(config, 'rope_scaling') and config.rope_scaling is not None:
@@ -68,7 +73,7 @@ class MicrogliaPruningSystem:
                         config.rope_scaling = None
             
             self.model = AutoModelForCausalLM.from_pretrained(
-                model,
+                model_name,
                 config=config,
                 device_map="auto",
                 torch_dtype=torch.bfloat16,
@@ -76,10 +81,10 @@ class MicrogliaPruningSystem:
                 trust_remote_code=True
             )
             
-            self.tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
             
             # Fix Phi-3 EOS token issue
-            if 'phi-3' in model.lower():
+            if 'phi-3' in model_name.lower():
                 self.logger.info("Fixing Phi-3 EOS token issue...")
                 self.tokenizer.eos_token = "<|end|>"
                 self.tokenizer.pad_token = "<|end|>" 
@@ -101,12 +106,15 @@ class MicrogliaPruningSystem:
         
         # Determine layers
         layers = self.get_layers()
+        detected_num_heads = getattr(getattr(self.model, "config", object()), "num_attention_heads", num_heads)
+        self.num_heads = int(detected_num_heads or num_heads)
         self.logger.info(f"Model has {len(layers)} layers")
+        self.logger.info(f"Detected attention heads: {self.num_heads}")
         
         self.logger.info(f"Initializing {len(layers)} pruning agents...")
         total_layers = len(layers)
         self.agents = nn.ModuleList([
-            MicrogliaAgent(hidden_dim, num_heads, temperature, num_layers=total_layers, layer_idx=layer_idx)
+            MicrogliaAgent(hidden_dim, self.num_heads, temperature, num_layers=total_layers, layer_idx=layer_idx)
             for layer_idx in range(total_layers)
         ])
         self.agents.to(device)
@@ -117,6 +125,8 @@ class MicrogliaPruningSystem:
         
         self.activation_cache = {}
         self.training_history = []
+        self.budget_controller = DynamicPruningBudget()
+        self.last_budget = None
         
         self.logger.info("System initialized successfully!")
         self.logger.info("Note: Pruning is DISABLED until training starts")
@@ -171,6 +181,16 @@ class MicrogliaPruningSystem:
                 layer.self_attn.enable_pruning = enable
         
         print(f"Pruning {'ENABLED' if enable else 'DISABLED'}")
+
+    def _set_budget_keep_ratio(self, keep_ratio: Optional[float]) -> None:
+        """Set optional keep-ratio budget across all wrapped layers."""
+        self.last_budget = keep_ratio
+        if not self.wrapped:
+            return
+
+        for layer in self.get_layers():
+            if isinstance(layer.self_attn, PrunedAttention):
+                layer.self_attn.set_budget_keep_ratio(keep_ratio)
 
     def set_hard_prune(self, enable: bool = True):
         """Enable or disable hard thresholding for pruning (inference)."""
@@ -446,7 +466,7 @@ class MicrogliaPruningSystem:
         self.logger.info("Training Complete!")
         self.logger.info("="*60)
     
-    def generate(self, prompt: str, max_new_tokens: int = 256, use_pruning: bool = None, **kwargs):
+    def generate(self, prompt: str, max_new_tokens: int = 256, use_pruning: bool = None, budget_keep_ratio: Optional[float] = None, **kwargs):
         """Generate text with optional pruning."""
         if self.tokenizer is None:
             raise ValueError("No tokenizer available")
@@ -457,6 +477,12 @@ class MicrogliaPruningSystem:
 
         # Ensure pruning state is correct
         self._enable_pruning(use_pruning)
+        if use_pruning:
+            if budget_keep_ratio is None:
+                budget_keep_ratio = self.budget_controller.compute_keep_ratio(prompt)
+            self._set_budget_keep_ratio(budget_keep_ratio)
+        else:
+            self._set_budget_keep_ratio(None)
         self.model.eval()
         
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
