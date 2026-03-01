@@ -14,10 +14,12 @@ from datasets import load_dataset
 
 from src.pareto import ParetoPoint, compute_pareto_frontier
 from src.system import MicrogliaPruningSystem
+from src.inference import InferenceEngine, GenerationConfig
 
 
 def benchmark_budget(
     system: MicrogliaPruningSystem,
+    engine: InferenceEngine,
     questions: List[str],
     answers: List[str],
     budget: float,
@@ -28,9 +30,9 @@ def benchmark_budget(
     for question, answer in zip(questions, answers):
         prompt = f"Question: {question}\nAnswer:"
         start = time.perf_counter()
-        output = system.generate(
+        output = engine.generate(
             prompt,
-            max_new_tokens=max_new_tokens,
+            config=GenerationConfig(max_new_tokens=max_new_tokens),
             use_pruning=True,
             budget_keep_ratio=budget,
         )
@@ -63,13 +65,14 @@ def main() -> None:
 
     system = MicrogliaPruningSystem(model=args.base_model)
     system.load(args.model_path)
+    engine = InferenceEngine(model_name=args.base_model, backend="hf", pruning_system=system)
 
     ds = load_dataset(args.dataset, "main", split="test")
     ds = ds.select(range(min(args.max_examples, len(ds))))
     questions = [row["question"] for row in ds]
     answers = [row["answer"] for row in ds]
 
-    points = [benchmark_budget(system, questions, answers, budget, args.max_new_tokens) for budget in args.budgets]
+    points = [benchmark_budget(system, engine, questions, answers, budget, args.max_new_tokens) for budget in args.budgets]
     pareto = compute_pareto_frontier(points)
 
     results_json = {

@@ -133,6 +133,13 @@ results = system.evaluate(dataset_name="gsm8k")
 print(f"Accuracy: {results['accuracy']:.2%}")
 ```
 
+
+## Documentation
+
+- [Getting Started](docs/getting_started.md)
+- [Advanced Features](docs/advanced_features.md)
+- [Production Deployment](docs/production_deployment.md)
+
 ## Testing
 
 The repository includes three main scripts for testing:

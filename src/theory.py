@@ -1,4 +1,12 @@
-"""Theoretical analysis helpers linking dynamic pruning to lottery-ticket style behavior."""
+"""Theoretical analysis helpers linking dynamic pruning to lottery-ticket style behavior.
+
+Example:
+    >>> import numpy as np
+    >>> from src.theory import analyze_lottery_ticket_behavior
+    >>> masks = np.ones((2, 1, 2), dtype=float)
+    >>> analyze_lottery_ticket_behavior(masks).winning_ticket_score
+    1.0
+"""
 
 from __future__ import annotations
 

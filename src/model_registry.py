@@ -1,4 +1,10 @@
-"""Model registry for reproducible multi-model experiments."""
+"""Model registry for reproducible multi-model experiments.
+
+Example:
+    >>> from src.model_registry import resolve_model_spec
+    >>> resolve_model_spec("phi3").name
+    'microsoft/phi-3-mini-4k-instruct'
+"""
 
 from __future__ import annotations
 
@@ -37,10 +43,19 @@ MODEL_REGISTRY: Dict[str, ModelSpec] = {
     ),
 }
 
+MODEL_ALIASES: Dict[str, str] = {
+    "phi3": "phi3-mini",
+    "phi-3": "phi3-mini",
+    "llama3": "llama3-8b",
+    "llama-3": "llama3-8b",
+    "mistral": "mistral-7b",
+}
+
 
 def resolve_model_spec(model_name_or_key: str) -> ModelSpec:
     """Resolve either a model key or a raw HF identifier into a ModelSpec."""
     key = model_name_or_key.strip().lower()
+    key = MODEL_ALIASES.get(key, key)
     if key in MODEL_REGISTRY:
         return MODEL_REGISTRY[key]
 

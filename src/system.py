@@ -215,7 +215,8 @@ class MicrogliaPruningSystem:
              max_steps_per_epoch: int = 30,
              val_split: float = 0.1,
              early_stopping_patience: int = 3,
-             precision: str = "fp32"):
+             precision: str = "fp32",
+             use_budget: bool = True):
         """Train the pruning agents on a reasoning dataset with validation and checkpointing.
 
         Args:
@@ -229,6 +230,7 @@ class MicrogliaPruningSystem:
             val_split: Fraction of data to use for validation.
             early_stopping_patience: Number of epochs to wait for validation improvement.
             precision: Mixed precision mode in {'fp32', 'fp16', 'bf16'}.
+            use_budget: Use DynamicPruningBudget-generated keep ratios during training.
         """
         self.logger.info("\n" + "="*60)
         self.logger.info("Starting Training")
@@ -251,6 +253,11 @@ class MicrogliaPruningSystem:
 
         # Enable pruning for training
         self._enable_pruning(True)
+
+        if use_budget:
+            self.logger.info("Dynamic pruning budget is ENABLED for training")
+        else:
+            self.logger.info("Dynamic pruning budget is DISABLED for training")
         
         self.logger.info(f"Loading {dataset_name} dataset...")
         dataset = load_dataset(dataset_name, "main")
@@ -355,7 +362,14 @@ class MicrogliaPruningSystem:
             
             for step, batch in enumerate(progress_bar):
                 batch = {k: v.to(self.device) for k, v in batch.items()}
-                
+
+                if use_budget:
+                    prompt_preview = self.tokenizer.decode(batch["input_ids"][0], skip_special_tokens=True)
+                    keep_ratio = self.budget_controller.compute_keep_ratio(prompt_preview)
+                    self._set_budget_keep_ratio(keep_ratio)
+                else:
+                    self._set_budget_keep_ratio(None)
+
                 amp_context = (
                     torch.autocast(device_type='cuda', dtype=amp_dtype)
                     if precision in {'fp16', 'bf16'} and torch.cuda.is_available()

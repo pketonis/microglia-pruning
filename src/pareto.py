@@ -1,4 +1,11 @@
-"""Pareto frontier utilities for accuracy/latency trade-off analysis."""
+"""Pareto frontier utilities for accuracy/latency trade-off analysis.
+
+Example:
+    >>> from src.pareto import ParetoPoint, compute_pareto_frontier
+    >>> points = [ParetoPoint("a", 0.8, 100.0, 0.4), ParetoPoint("b", 0.82, 95.0, 0.35)]
+    >>> len(compute_pareto_frontier(points).frontier)
+    1
+"""
 
 from __future__ import annotations
 

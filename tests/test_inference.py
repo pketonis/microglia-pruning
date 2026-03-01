@@ -59,3 +59,14 @@ def test_vllm_import_error_message():
     with patch("builtins.__import__", side_effect=fake_import):
         with pytest.raises(InferenceBackendError):
             VLLMBackend("dummy")
+
+
+class DummyPruningSystem:
+    def generate(self, prompt, max_new_tokens=128, use_pruning=True, budget_keep_ratio=None):
+        return f"pruned:{prompt}:{max_new_tokens}:{use_pruning}:{budget_keep_ratio}"
+
+
+def test_inference_engine_pruning_system_path():
+    engine = InferenceEngine(model_name="dummy", pruning_system=DummyPruningSystem())
+    out = engine.generate("hello", config=GenerationConfig(max_new_tokens=32), budget_keep_ratio=0.6)
+    assert out.startswith("pruned:hello:32:True:0.6")

@@ -8,6 +8,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from src.system import MicrogliaPruningSystem
 from src.utils import set_seed
+from src.rigor import ExperimentTracker
 
 
 def main():
@@ -97,6 +98,29 @@ def main():
         choices=["fp32", "fp16", "bf16"],
         help="Mixed precision mode"
     )
+    parser.add_argument(
+        "--use-budget",
+        action="store_true",
+        default=True,
+        help="Enable dynamic complexity-aware pruning budgets during training"
+    )
+    parser.add_argument(
+        "--no-use-budget",
+        dest="use_budget",
+        action="store_false",
+        help="Disable dynamic pruning budget controller during training"
+    )
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Enable Weights & Biases tracking"
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="microglia-pruning",
+        help="W&B project name"
+    )
     
     args = parser.parse_args()
     
@@ -126,6 +150,8 @@ def main():
         temperature=args.temperature
     )
     
+    tracker = ExperimentTracker(enabled=args.wandb, project=args.wandb_project, config=vars(args))
+
     # Train
     print("\nStarting training...")
     system.train(
@@ -136,14 +162,18 @@ def main():
         alpha_schedule=(args.alpha_min, args.alpha_max),
         use_lora=args.use_lora,
         max_steps_per_epoch=args.max_steps_per_epoch,
-        precision=args.precision
+        precision=args.precision,
+        use_budget=args.use_budget
     )
     
     # Save checkpoint
     checkpoint_path = os.path.join(args.output_dir, "pruning_system.pt")
     print(f"\nSaving checkpoint to {checkpoint_path}...")
     system.save(checkpoint_path)
-    
+
+    tracker.log({"status": "completed"})
+    tracker.finish()
+
     print("\nTraining complete!")
 
 
