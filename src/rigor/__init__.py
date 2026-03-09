@@ -7,7 +7,24 @@ Example:
     True
 """
 
-from .statistics import bootstrap_ci, paired_bootstrap_test
+from .statistics import (
+    bca_bootstrap_ci,
+    bootstrap_ci,
+    cohen_d,
+    holm_bonferroni,
+    paired_bootstrap_test,
+    permutation_test_paired,
+    power_analysis_min_detectable_effect,
+)
 from .tracking import ExperimentTracker
 
-__all__ = ["bootstrap_ci", "paired_bootstrap_test", "ExperimentTracker"]
+__all__ = [
+    "bootstrap_ci",
+    "bca_bootstrap_ci",
+    "paired_bootstrap_test",
+    "cohen_d",
+    "holm_bonferroni",
+    "permutation_test_paired",
+    "power_analysis_min_detectable_effect",
+    "ExperimentTracker",
+]

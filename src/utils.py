@@ -12,8 +12,11 @@ import numpy as np
 import random
 import logging
 import sys
+import os
 
-def set_seed(seed: int = 42):
+from transformers import set_seed as hf_set_seed
+
+def set_seed(seed: int = 42, deterministic: bool = True):
     """Set seeds for reproducibility.
 
     Args:
@@ -21,11 +24,17 @@ def set_seed(seed: int = 42):
     """
     random.seed(seed)
     np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    hf_set_seed(seed)
     # Ensure deterministic behavior in some operations
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    if deterministic:
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 def setup_logging(name: str = "microglia", level: int = logging.INFO) -> logging.Logger:
     """Set up structured logging.
