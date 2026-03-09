@@ -108,58 +108,60 @@ class PrunedAttention(nn.Module):
         
         # If we have attention weights, compute stats and apply pruning
         if attn_weights is not None:
-            try:
-                # Store original dtype to cast back later
-                original_dtype = hidden_states.dtype
+            # Store original dtype to cast back later
+            original_dtype = hidden_states.dtype
 
-                # Compute per-head statistics
-                stats = compute_layer_stats(hidden_states, attn_weights)
-                
-                # Ensure stats are float32 for the agent
-                stats = stats.to(torch.float32)
+            # Compute per-head statistics
+            stats = compute_layer_stats(hidden_states, attn_weights)
 
-                # Get pruning masks from agent
-                masks = self.agent(stats)  # (batch, num_heads)
-                
-                # Cast masks back to original dtype for application
-                masks = masks.to(original_dtype)
+            # Ensure stats are float32 for the agent
+            stats = stats.to(torch.float32)
 
-                # Apply hard threshold in eval mode
-                if self.hard_prune and not self.training:
-                    masks = (masks > 0.5).float()
+            # Get pruning masks from agent
+            masks = self.agent(stats)  # (batch, num_heads)
 
-                masks = self._apply_budget(masks)
-                
-                # Store for monitoring
-                self.last_masks = masks.detach()
-                self.last_stats = stats.detach()
-                
-                # Apply masks to attention output
-                batch_size, seq_len, hidden_dim = attn_output.shape
-                num_heads = masks.shape[1]
-                head_dim = hidden_dim // num_heads
-                
-                # Reshape to separate heads
-                attn_output = attn_output.view(batch_size, seq_len, num_heads, head_dim)
-                
-                # Broadcast masks: (batch, num_heads) -> (batch, 1, num_heads, 1)
-                masks_expanded = masks.unsqueeze(1).unsqueeze(-1)
-                
-                # Apply masking
-                attn_output = attn_output * masks_expanded
-                
-                # Reshape back
-                attn_output = attn_output.view(batch_size, seq_len, hidden_dim)
-                
-                # Return in original format
-                if isinstance(attn_outputs, tuple):
-                    return (attn_output,) + attn_outputs[1:]
-                else:
-                    return attn_output
-            except Exception as e:
-                # If pruning fails, just return original output
-                print(f"Pruning failed: {e}, using original output")
-                return attn_outputs
+            # Cast masks back to original dtype for application
+            masks = masks.to(original_dtype)
+
+            # Apply hard threshold in eval mode
+            if self.hard_prune and not self.training:
+                masks = (masks > 0.5).to(original_dtype)
+
+            masks = self._apply_budget(masks)
+
+            # Edge-case stability: avoid total head collapse per sample.
+            all_zero = masks.sum(dim=1, keepdim=True) <= 1e-8
+            if all_zero.any():
+                fallback_idx = masks.argmax(dim=1, keepdim=True)
+                fallback = torch.zeros_like(masks).scatter(1, fallback_idx, 1.0).to(masks.dtype)
+                masks = torch.where(all_zero, fallback, masks)
+
+            # Store for monitoring
+            self.last_masks = masks.detach()
+            self.last_stats = stats.detach()
+
+            # Apply masks to attention output
+            batch_size, seq_len, hidden_dim = attn_output.shape
+            num_heads = masks.shape[1]
+            head_dim = hidden_dim // num_heads
+
+            # Reshape to separate heads
+            attn_output = attn_output.view(batch_size, seq_len, num_heads, head_dim)
+
+            # Broadcast masks: (batch, num_heads) -> (batch, 1, num_heads, 1)
+            masks_expanded = masks.unsqueeze(1).unsqueeze(-1)
+
+            # Apply masking
+            attn_output = attn_output * masks_expanded
+
+            # Reshape back
+            attn_output = attn_output.view(batch_size, seq_len, hidden_dim)
+
+            # Return in original format
+            if isinstance(attn_outputs, tuple):
+                return (attn_output,) + attn_outputs[1:]
+            else:
+                return attn_output
         
         # Return original if no pruning applied
         return attn_outputs

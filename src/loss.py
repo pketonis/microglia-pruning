@@ -8,6 +8,7 @@ Copyright (c) 2026
 """
 from typing import Any, Dict, Optional
 
+import math
 import torch
 import torch.nn.functional as F
 
@@ -72,10 +73,11 @@ def compute_pruning_loss(
 
 def get_alpha_schedule(epoch: int, max_epochs: int,
                       alpha_min: float = 0.01,
-                      alpha_max: float = 0.3) -> float:
+                      alpha_max: float = 0.3,
+                      schedule_type: str = "linear") -> float:
     """Calculates the sparsity weight (alpha) for curriculum learning.
 
-    The pruning pressure (alpha) increases linearly over training to allow the
+    The pruning pressure (alpha) increases over training to allow the
     agents to first identify head importance before enforcing sparsity.
 
     Args:
@@ -83,14 +85,39 @@ def get_alpha_schedule(epoch: int, max_epochs: int,
         max_epochs (int): Total number of epochs.
         alpha_min (float): Starting value of alpha.
         alpha_max (float): Final value of alpha.
+        schedule_type (str): One of {"linear", "cosine", "exponential"}.
 
     Returns:
         float: The sparsity weight for the current epoch.
-    """
-    progress = epoch / max(max_epochs - 1, 1)
-    alpha = alpha_min + (alpha_max - alpha_min) * progress
 
-    return alpha
+    Raises:
+        ValueError: If alpha values or schedule settings are unsafe.
+    """
+    if alpha_min < 0 or alpha_max < 0:
+        raise ValueError("alpha values must be non-negative. Fix by: use alpha >= 0.")
+    if alpha_min > 1.0 or alpha_max > 1.0:
+        raise ValueError("alpha values must be <= 1.0. Fix by: keep alpha in [0, 1].")
+    if alpha_max < alpha_min:
+        raise ValueError("alpha_max must be >= alpha_min. Fix by: swap or adjust schedule bounds.")
+    if max_epochs <= 0:
+        raise ValueError("max_epochs must be >= 1. Fix by: set a positive epoch count.")
+
+    if max_epochs == 1:
+        return float(alpha_max)
+
+    progress = min(max(epoch / max(max_epochs - 1, 1), 0.0), 1.0)
+
+    if schedule_type == "linear":
+        alpha = alpha_min + (alpha_max - alpha_min) * progress
+    elif schedule_type == "cosine":
+        alpha = alpha_min + (alpha_max - alpha_min) * 0.5 * (1.0 - math.cos(math.pi * progress))
+    elif schedule_type == "exponential":
+        growth = 5.0
+        alpha = alpha_min + (alpha_max - alpha_min) * ((math.exp(growth * progress) - 1.0) / (math.exp(growth) - 1.0))
+    else:
+        raise ValueError("schedule_type must be one of {'linear', 'cosine', 'exponential'}. Fix by: choose a supported schedule.")
+
+    return float(alpha)
 
 
 def compute_efficiency_metrics(masks: torch.Tensor) -> Dict[str, float]:

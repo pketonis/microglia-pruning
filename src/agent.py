@@ -7,6 +7,7 @@ Authors: Tommaso R. Marena (The Catholic University of America)
 Copyright (c) 2026
 """
 import math
+import warnings
 from typing import Optional
 
 import torch
@@ -41,6 +42,14 @@ class MicrogliaAgent(nn.Module):
             layer_idx (int): Layer index for this agent (0-indexed).
         """
         super().__init__()
+        if temperature <= 0:
+            raise ValueError("temperature must be > 0. Fix by: pass a positive value such as 1.0.")
+        if temperature < 0.1:
+            warnings.warn(
+                "temperature < 0.1 may saturate sigmoid gates and harm gradient flow. "
+                "Fix by: using temperature >= 0.1 for stable training.",
+                UserWarning,
+            )
         self.num_heads: int = num_heads
         self.temperature: float = temperature
         
@@ -111,4 +120,12 @@ class MicrogliaAgent(nn.Module):
         Args:
             temperature (float): The new temperature value.
         """
+        if temperature <= 0:
+            raise ValueError("temperature must be > 0. Fix by: pass a positive value such as 1.0.")
+        if temperature < 0.1:
+            warnings.warn(
+                "temperature < 0.1 may saturate sigmoid gates and harm gradient flow. "
+                "Fix by: using temperature >= 0.1 for stable training.",
+                UserWarning,
+            )
         self.temperature = temperature

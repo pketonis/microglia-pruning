@@ -53,8 +53,11 @@ class MicrogliaPruningSystem:
             seed (int): Random seed for reproducibility.
         """
         
+        if temperature <= 0:
+            raise ValueError("temperature must be > 0. Fix by: pass a positive value such as 1.0.")
         self.device = device
         self.num_heads = num_heads
+        self.temperature = float(temperature)
         self.current_masks = {}
         self.pruning_enabled = False
         self.logger = setup_logging("MicrogliaSystem")
@@ -217,6 +220,7 @@ class MicrogliaPruningSystem:
              batch_size: int = 2,
              learning_rate: float = 1e-4,
              alpha_schedule: Tuple[float, float] = (0.01, 0.3),
+             alpha_schedule_type: str = "linear",
              use_lora: bool = True,
              max_steps_per_epoch: int = 30,
              val_split: float = 0.1,
@@ -231,6 +235,7 @@ class MicrogliaPruningSystem:
             batch_size: Training batch size.
             learning_rate: Learning rate for pruning agents.
             alpha_schedule: Tuple of (alpha_min, alpha_max) for curriculum learning.
+            alpha_schedule_type: One of {'linear', 'cosine', 'exponential'}.
             use_lora: Whether to use LoRA for the base model.
             max_steps_per_epoch: Maximum number of steps per epoch.
             val_split: Fraction of data to use for validation.
@@ -346,14 +351,14 @@ class MicrogliaPruningSystem:
         scaler = torch.cuda.amp.GradScaler(enabled=(precision == 'fp16' and torch.cuda.is_available()))
         
         self.logger.info(f"\nTraining for {num_epochs} epochs...")
-        self.logger.info(f"Alpha schedule: {alpha_min} -> {alpha_max}\n")
+        self.logger.info(f"Alpha schedule ({alpha_schedule_type}): {alpha_min} -> {alpha_max}\n")
         
         best_val_loss = float('inf')
         best_agents_state = None
         patience_counter = 0
 
         for epoch in range(num_epochs):
-            alpha = get_alpha_schedule(epoch, num_epochs, alpha_min, alpha_max)
+            alpha = get_alpha_schedule(epoch, num_epochs, alpha_min, alpha_max, schedule_type=alpha_schedule_type)
             epoch_metrics = {'task_loss': 0.0, 'sparsity_loss': 0.0, 'total_loss': 0.0}
             
             print(f"\nEpoch {epoch+1}/{num_epochs} (alpha={alpha:.3f})")
@@ -640,19 +645,63 @@ class MicrogliaPruningSystem:
                 return None
         return None
     
-    def save(self, path: str):
-        """Save the trained pruning system."""
-        print(f"Saving model to {path}...")
-        torch.save({
+    def save_checkpoint(self, path: str, optimizer: Optional[torch.optim.Optimizer] = None):
+        """Save pruning agents, optional LoRA weights, and training configuration."""
+        print(f"Saving checkpoint to {path}...")
+        payload = {
+            'version': 2,
             'agents': self.agents.state_dict(),
             'training_history': self.training_history,
-        }, path)
+            'config': {
+                'num_heads': self.num_heads,
+                'temperature': self.temperature,
+                'last_budget': self.last_budget,
+                'pruning_enabled': self.pruning_enabled,
+            },
+        }
+        if self.lora_applied:
+            payload['lora'] = self.model.state_dict()
+        if optimizer is not None:
+            payload['optimizer'] = optimizer.state_dict()
+        torch.save(payload, path)
         print("Saved successfully!")
-    
-    def load(self, path: str):
-        """Load a trained pruning system."""
-        print(f"Loading model from {path}...")
+
+    def load_checkpoint(self, path: str, optimizer: Optional[torch.optim.Optimizer] = None, load_lora: bool = True):
+        """Load checkpoint and restore agents/config; optionally restore LoRA + optimizer state."""
+        print(f"Loading checkpoint from {path}...")
         checkpoint = torch.load(path, map_location=self.device)
-        self.agents.load_state_dict(checkpoint['agents'])
+
+        if 'agents' not in checkpoint:
+            raise KeyError("Checkpoint missing 'agents'. Fix by: load a valid microglia checkpoint.")
+        self.agents.load_state_dict(checkpoint['agents'], strict=False)
         self.training_history = checkpoint.get('training_history', [])
+
+        config = checkpoint.get('config', {})
+        self.last_budget = config.get('last_budget', None)
+        self.temperature = float(config.get('temperature', self.temperature))
+        for agent in self.agents:
+            agent.set_temperature(self.temperature)
+
+        if load_lora:
+            if 'lora' not in checkpoint and self.lora_applied:
+                raise KeyError(
+                    "Requested LoRA restore but checkpoint has no 'lora'. Fix by: save with LoRA enabled or load_lora=False."
+                )
+            if 'lora' in checkpoint:
+                self.model.load_state_dict(checkpoint['lora'], strict=False)
+        elif 'lora' in checkpoint and not self.lora_applied:
+            raise ValueError(
+                "Checkpoint contains LoRA weights but system has no LoRA adapters. Fix by: call _apply_lora() first or set load_lora=True after adapters are created."
+            )
+
+        if optimizer is not None and 'optimizer' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer'])
         print("Loaded successfully!")
+
+    def save(self, path: str):
+        """Backward-compatible wrapper for :meth:`save_checkpoint`."""
+        self.save_checkpoint(path)
+
+    def load(self, path: str):
+        """Backward-compatible wrapper for :meth:`load_checkpoint`."""
+        self.load_checkpoint(path, load_lora=False)
