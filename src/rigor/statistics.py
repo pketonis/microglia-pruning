@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List
+from math import erf, sqrt
+from statistics import NormalDist
+from typing import Dict, Iterable, List, Optional
 
 import numpy as np
 
@@ -86,6 +88,7 @@ def paired_bootstrap_test(
 
     # Two-sided p-value via bootstrap sign test approximation
     effect = float(diff.mean())
+    d = cohen_d(base, trt)
     p_left = np.mean(boot_effect <= 0.0)
     p_right = np.mean(boot_effect >= 0.0)
     p_val = float(2.0 * min(p_left, p_right))
@@ -95,12 +98,129 @@ def paired_bootstrap_test(
         metric_name=metric_name,
         baseline_mean=float(base.mean()),
         treatment_mean=float(trt.mean()),
-        effect_size=effect,
+        effect_size=d,
         ci_low=ci_low,
         ci_high=ci_high,
         p_value=p_val,
     )
 
+
+
+def cohen_d(baseline: Iterable[float], treatment: Iterable[float]) -> float:
+    """Compute Cohen's d effect size for two samples."""
+    base = _to_numpy(baseline)
+    trt = _to_numpy(treatment)
+    if base.shape != trt.shape:
+        raise ValueError("Baseline and treatment arrays must have the same shape.")
+
+    delta = trt - base
+    std = float(np.std(delta, ddof=1)) if delta.size > 1 else 0.0
+    if std == 0.0:
+        return 0.0
+    return float(np.mean(delta) / std)
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + erf(x / sqrt(2.0)))
+
+
+def bca_bootstrap_ci(
+    values: Iterable[float],
+    statistic_fn=np.mean,
+    num_bootstrap: int = 1000,
+    ci: float = 0.95,
+    seed: int = 42,
+) -> Dict[str, float]:
+    """Compute BCa bootstrap CI for a scalar statistic."""
+    samples = _to_numpy(values)
+    n = samples.shape[0]
+    rng = np.random.default_rng(seed)
+
+    theta_hat = float(statistic_fn(samples))
+
+    boot = np.empty(num_bootstrap, dtype=float)
+    for i in range(num_bootstrap):
+        idx = rng.integers(0, n, size=n)
+        boot[i] = float(statistic_fn(samples[idx]))
+
+    prop_less = float(np.mean(boot < theta_hat))
+    prop_less = min(max(prop_less, 1e-10), 1 - 1e-10)
+    z0 = NormalDist().inv_cdf(prop_less)
+
+    jack = np.empty(n, dtype=float)
+    for i in range(n):
+        jack[i] = float(statistic_fn(np.delete(samples, i)))
+    jack_mean = float(np.mean(jack))
+    num = float(np.sum((jack_mean - jack) ** 3))
+    den = float(np.sum((jack_mean - jack) ** 2))
+    a = num / (6.0 * (den ** 1.5)) if den > 0 else 0.0
+
+    alpha = 1.0 - ci
+    z_low = NormalDist().inv_cdf(alpha / 2.0)
+    z_high = NormalDist().inv_cdf(1.0 - alpha / 2.0)
+
+    adj_low = _norm_cdf(z0 + (z0 + z_low) / max(1e-12, (1 - a * (z0 + z_low))))
+    adj_high = _norm_cdf(z0 + (z0 + z_high) / max(1e-12, (1 - a * (z0 + z_high))))
+
+    ci_low = float(np.quantile(boot, min(max(adj_low, 0.0), 1.0)))
+    ci_high = float(np.quantile(boot, min(max(adj_high, 0.0), 1.0)))
+
+    return {"mean": theta_hat, "ci_low": ci_low, "ci_high": ci_high}
+
+
+def holm_bonferroni(p_values: Iterable[float], alpha: float = 0.05) -> List[bool]:
+    """Holm-Bonferroni rejection decisions in original order."""
+    pv = list(float(p) for p in p_values)
+    order = sorted(range(len(pv)), key=lambda i: pv[i])
+    reject = [False] * len(pv)
+    m = len(pv)
+    for rank, idx in enumerate(order):
+        threshold = alpha / (m - rank)
+        if pv[idx] <= threshold:
+            reject[idx] = True
+        else:
+            break
+    return reject
+
+
+def power_analysis_min_detectable_effect(
+    n: int,
+    alpha: float = 0.05,
+    power: float = 0.8,
+) -> float:
+    """Approximate minimum detectable standardized effect size (two-sided z-test)."""
+    if n <= 1:
+        raise ValueError("n must be greater than 1")
+    z_alpha = NormalDist().inv_cdf(1 - alpha / 2.0)
+    z_power = NormalDist().inv_cdf(power)
+    return float((z_alpha + z_power) / sqrt(n))
+
+
+def permutation_test_paired(
+    baseline: Iterable[float],
+    treatment: Iterable[float],
+    n_permutations: int = 5000,
+    seed: int = 42,
+) -> float:
+    """Paired permutation test using random sign flips."""
+    base = _to_numpy(baseline)
+    trt = _to_numpy(treatment)
+    if base.shape != trt.shape:
+        raise ValueError("Baseline and treatment arrays must have the same shape.")
+
+    diff = trt - base
+    observed = abs(float(np.mean(diff)))
+    rng = np.random.default_rng(seed)
+
+    samples = 0
+    extreme = 0
+    for _ in range(n_permutations):
+        signs = rng.choice([-1.0, 1.0], size=diff.shape[0])
+        stat = abs(float(np.mean(diff * signs)))
+        samples += 1
+        if stat >= observed:
+            extreme += 1
+    return float((extreme + 1) / (samples + 1))
 
 def summarize_significance(results: List[BootstrapResult]) -> List[Dict[str, float]]:
     """Convert bootstrap result objects to serializable dictionaries."""

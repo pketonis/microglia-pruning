@@ -121,11 +121,12 @@ def main():
         default="microglia-pruning",
         help="W&B project name"
     )
+    parser.add_argument("--seed", type=int, default=42, help="Global random seed")
     
     args = parser.parse_args()
     
     # Set seed for reproducibility
-    set_seed(42)
+    set_seed(args.seed)
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -150,7 +151,13 @@ def main():
         temperature=args.temperature
     )
     
-    tracker = ExperimentTracker(enabled=args.wandb, project=args.wandb_project, config=vars(args))
+    tracker = ExperimentTracker(
+        enabled=args.wandb,
+        project=args.wandb_project,
+        config=vars(args),
+        group=f"{args.dataset}-hidden{args.hidden_dim}-temp{args.temperature}",
+        tags=[f"seed:{args.seed}", f"dataset:{args.dataset}"],
+    )
 
     # Train
     print("\nStarting training...")

@@ -12,23 +12,26 @@ from fvcore.nn import FlopCountAnalysis
 from src.system import MicrogliaPruningSystem
 
 
-def measure_latency(system, prompt, num_runs=50):
-    """Measure average latency over multiple runs using CUDA events for precision."""
+def measure_latency(system, prompt, num_runs=50, warmup_runs=10):
+    """Measure latency with warmup and robust summary stats."""
     latencies = []
-    
+
     # Warmup
-    for _ in range(5):
+    for _ in range(warmup_runs):
         with torch.no_grad():
-            _ = system.generate(prompt, max_new_tokens=10)
+            effective_prompt = prompt[0] if isinstance(prompt, list) else prompt
+            _ = system.generate(effective_prompt, max_new_tokens=10)
 
     if torch.cuda.is_available():
         for _ in range(num_runs):
+            torch.cuda.empty_cache()
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
 
             start_event.record()
             with torch.no_grad():
-                _ = system.generate(prompt, max_new_tokens=256)
+                effective_prompt = prompt[0] if isinstance(prompt, list) else prompt
+                _ = system.generate(effective_prompt, max_new_tokens=256)
             end_event.record()
 
             torch.cuda.synchronize()
@@ -37,14 +40,26 @@ def measure_latency(system, prompt, num_runs=50):
         for _ in range(num_runs):
             start = time.time()
             with torch.no_grad():
-                _ = system.generate(prompt, max_new_tokens=256)
+                effective_prompt = prompt[0] if isinstance(prompt, list) else prompt
+                _ = system.generate(effective_prompt, max_new_tokens=256)
             latencies.append((time.time() - start) * 1000)
     
+    arr = torch.tensor(latencies, dtype=torch.float64)
+    median = float(torch.median(arr).item())
+    n = len(latencies)
+    idx = torch.randint(0, n, (1000, n))
+    boot = arr[idx].median(dim=1).values
+    ci_low = float(torch.quantile(boot, 0.025).item())
+    ci_high = float(torch.quantile(boot, 0.975).item())
+
     return {
-        'mean_ms': sum(latencies) / len(latencies),
-        'min_ms': min(latencies),
-        'max_ms': max(latencies),
-        'std_ms': torch.tensor(latencies).std().item() if len(latencies) > 1 else 0.0
+        'mean_ms': float(arr.mean().item()),
+        'median_ms': median,
+        'min_ms': float(arr.min().item()),
+        'max_ms': float(arr.max().item()),
+        'std_ms': float(arr.std().item()) if len(latencies) > 1 else 0.0,
+        'ci95_median_low_ms': ci_low,
+        'ci95_median_high_ms': ci_high,
     }
 
 
@@ -84,6 +99,8 @@ def main():
         default=1,
         help="Batch size for benchmarking"
     )
+    parser.add_argument("--warmup_runs", type=int, default=10, help="Warmup iterations before measurement")
+    parser.add_argument("--batch_sizes", nargs="+", type=int, default=[1,4,8,16,32], help="Batch sizes to benchmark")
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -129,7 +146,11 @@ def main():
     
     # Measure latency
     print("\nMeasuring latency...")
-    latency_metrics = measure_latency(system, test_prompt, args.num_runs)
+    latency_by_batch = {}
+    for batch_size in args.batch_sizes:
+        prompts = [test_prompt] * batch_size
+        latency_by_batch[str(batch_size)] = measure_latency(system, prompts, args.num_runs, args.warmup_runs)
+    latency_metrics = latency_by_batch[str(args.batch_size)]
     
     # Measure memory
     print("Measuring memory usage...")
@@ -161,6 +182,7 @@ def main():
     # Compile results
     results = {
         'latency': latency_metrics,
+        'latency_by_batch': latency_by_batch,
         'memory': memory_metrics,
         'sparsity': sparsity,
         'flops': total_flops,
@@ -174,6 +196,8 @@ def main():
     print("\n" + "="*60)
     print("Benchmark Results")
     print("="*60)
+    print(f"Median Latency: {latency_metrics['median_ms']:.2f} ms")
+    print(f"Median 95% CI: [{latency_metrics['ci95_median_low_ms']:.2f}, {latency_metrics['ci95_median_high_ms']:.2f}] ms")
     print(f"Average Latency: {latency_metrics['mean_ms']:.2f} ms")
     print(f"Min Latency: {latency_metrics['min_ms']:.2f} ms")
     print(f"Max Latency: {latency_metrics['max_ms']:.2f} ms")
