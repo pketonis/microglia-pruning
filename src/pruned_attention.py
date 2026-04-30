@@ -83,15 +83,27 @@ class PrunedAttention(nn.Module):
             Tuple: Attention output and optional metadata.
         """
         
+        # Handle models with different attention signatures (e.g. GPT-2 vs Llama)
+        attn_kwargs = {
+            "attention_mask": attention_mask,
+            "output_attentions": output_attentions or self.enable_pruning,
+            "use_cache": use_cache,
+            **kwargs
+        }
+
+        # Map parameters based on naming conventions
+        if "position_ids" in self.attn.forward.__code__.co_varnames:
+            attn_kwargs["position_ids"] = position_ids
+
+        if "past_key_value" in self.attn.forward.__code__.co_varnames:
+            attn_kwargs["past_key_value"] = past_key_value
+        elif "layer_past" in self.attn.forward.__code__.co_varnames:
+            attn_kwargs["layer_past"] = past_key_value
+
         # Run original attention
         attn_outputs = self.attn(
             hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions or self.enable_pruning,  # Need weights for pruning
-            use_cache=use_cache,
-            **kwargs
+            **attn_kwargs
         )
         
         # Only apply pruning if explicitly enabled
@@ -108,8 +120,15 @@ class PrunedAttention(nn.Module):
         
         # If we have attention weights, compute stats and apply pruning
         if attn_weights is not None:
+            # Handle cases where attn_weights is a tuple (e.g. some GPT-2 configurations)
+            if isinstance(attn_weights, tuple):
+                attn_weights = attn_weights[0]
+
             # Store original dtype to cast back later
-            original_dtype = hidden_states.dtype
+            if isinstance(hidden_states, tuple):
+                original_dtype = hidden_states[0].dtype
+            else:
+                original_dtype = hidden_states.dtype
 
             # Compute per-head statistics
             stats = compute_layer_stats(hidden_states, attn_weights)

@@ -78,6 +78,9 @@ def compute_layer_stats(
         stats: Tensor of shape (batch, 6*num_heads) containing concatenated
                activation statistics and attention metrics for each head.
     """
+    if isinstance(hidden_states, tuple):
+        hidden_states = hidden_states[0]
+
     batch_size = hidden_states.shape[0]
     num_heads = attn_weights.shape[1]
     

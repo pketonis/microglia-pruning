@@ -7,7 +7,8 @@ import torch
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.loss import compute_pruning_loss
+import pytest
+from src.loss import compute_pruning_loss, get_alpha_schedule
 
 
 def test_compute_pruning_loss_with_distillation_and_layer_targets() -> None:
@@ -46,3 +47,36 @@ def test_compute_pruning_loss_without_optional_terms() -> None:
 
     assert out["distillation_loss"] == 0.0
     assert out["layer_sparsity_target_loss"] == 0.0
+
+
+def test_get_alpha_schedule() -> None:
+    # Linear
+    assert get_alpha_schedule(0, 10, 0.1, 0.5, "linear") == 0.1
+    assert get_alpha_schedule(9, 10, 0.1, 0.5, "linear") == 0.5
+    # Cosine
+    assert get_alpha_schedule(0, 10, 0.1, 0.5, "cosine") == 0.1
+    assert get_alpha_schedule(9, 10, 0.1, 0.5, "cosine") == 0.5
+    # Exponential
+    assert abs(get_alpha_schedule(0, 10, 0.1, 0.5, "exponential") - 0.1) < 1e-6
+    assert abs(get_alpha_schedule(9, 10, 0.1, 0.5, "exponential") - 0.5) < 1e-6
+
+
+def test_alpha_schedule_invalid() -> None:
+    with pytest.raises(ValueError, match="alpha values must be non-negative"):
+        get_alpha_schedule(0, 10, alpha_min=-1.0)
+    with pytest.raises(ValueError, match="alpha values must be <= 1.0"):
+        get_alpha_schedule(0, 10, alpha_min=1.5)
+    with pytest.raises(ValueError, match="alpha_max must be >= alpha_min"):
+        get_alpha_schedule(0, 10, alpha_min=0.5, alpha_max=0.1)
+    with pytest.raises(ValueError, match="max_epochs must be >= 1"):
+        get_alpha_schedule(0, 0)
+    with pytest.raises(ValueError, match="schedule_type must be one of"):
+        get_alpha_schedule(0, 10, schedule_type="invalid")
+
+
+def test_compute_efficiency_metrics() -> None:
+    from src.loss import compute_efficiency_metrics
+    masks = torch.tensor([[0.9, 0.1], [0.6, 0.4]])
+    out = compute_efficiency_metrics(masks)
+    assert out["active_heads"] == 1.0  # (1+1)/2
+    assert out["sparsity"] == 0.5

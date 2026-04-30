@@ -85,7 +85,7 @@ class MicrogliaPruningSystem:
                 model_name,
                 config=config,
                 device_map="auto",
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
                 attn_implementation="eager",
                 trust_remote_code=True
             )
@@ -146,10 +146,17 @@ class MicrogliaPruningSystem:
             return
         
         print("Applying LoRA for parameter-efficient training...")
+
+        # Determine target modules based on model architecture
+        target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
+        model_name = getattr(self.model.config, "_name_or_path", "").lower()
+        if "gpt2" in model_name:
+            target_modules = ["c_attn", "c_proj"]
+
         lora_config = LoraConfig(
             r=8,
             lora_alpha=16,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+            target_modules=target_modules,
             lora_dropout=0.05,
             task_type=TaskType.CAUSAL_LM
         )
@@ -169,13 +176,20 @@ class MicrogliaPruningSystem:
         layers = self.get_layers()
         print("Wrapping attention layers with pruning modules...")
         for idx, layer in enumerate(layers):
-            original_attn = layer.self_attn
-            layer.self_attn = PrunedAttention(
-                original_attn, 
-                self.agents[idx],
-                hard_prune=False
-            )
-            layer.self_attn.enable_pruning = False
+            attn = getattr(layer, "self_attn", getattr(layer, "attn", None))
+            if attn is not None:
+                new_attn = PrunedAttention(
+                    attn,
+                    self.agents[idx],
+                    hard_prune=False
+                )
+                new_attn.enable_pruning = False
+                if hasattr(layer, "self_attn"):
+                    layer.self_attn = new_attn
+                else:
+                    layer.attn = new_attn
+            else:
+                raise AttributeError(f"Could not find attention module in layer {type(layer)}")
         self.wrapped = True
     
     def _enable_pruning(self, enable: bool = True):
@@ -186,8 +200,9 @@ class MicrogliaPruningSystem:
         
         layers = self.get_layers()
         for layer in layers:
-            if isinstance(layer.self_attn, PrunedAttention):
-                layer.self_attn.enable_pruning = enable
+            attn = getattr(layer, "self_attn", getattr(layer, "attn", None))
+            if isinstance(attn, PrunedAttention):
+                attn.enable_pruning = enable
         
         print(f"Pruning {'ENABLED' if enable else 'DISABLED'}")
 
@@ -198,8 +213,9 @@ class MicrogliaPruningSystem:
             return
 
         for layer in self.get_layers():
-            if isinstance(layer.self_attn, PrunedAttention):
-                layer.self_attn.set_budget_keep_ratio(keep_ratio)
+            attn = getattr(layer, "self_attn", getattr(layer, "attn", None))
+            if isinstance(attn, PrunedAttention):
+                attn.set_budget_keep_ratio(keep_ratio)
 
     def set_hard_prune(self, enable: bool = True):
         """Enable or disable hard thresholding for pruning (inference)."""
@@ -209,8 +225,9 @@ class MicrogliaPruningSystem:
 
         layers = self.get_layers()
         for layer in layers:
-            if isinstance(layer.self_attn, PrunedAttention):
-                layer.self_attn.hard_prune = enable
+            attn = getattr(layer, "self_attn", getattr(layer, "attn", None))
+            if isinstance(attn, PrunedAttention):
+                attn.hard_prune = enable
 
         print(f"Hard pruning {'ENABLED' if enable else 'DISABLED'}")
     
@@ -397,8 +414,9 @@ class MicrogliaPruningSystem:
                 all_masks = []
                 layers = self.get_layers()
                 for layer in layers:
-                    if hasattr(layer.self_attn, 'last_masks') and layer.self_attn.last_masks is not None:
-                        all_masks.append(layer.self_attn.last_masks)
+                    attn = getattr(layer, "self_attn", getattr(layer, "attn", None))
+                    if hasattr(attn, 'last_masks') and attn.last_masks is not None:
+                        all_masks.append(attn.last_masks)
                 
                 if all_masks:
                     masks = torch.cat(all_masks, dim=0)
@@ -536,8 +554,9 @@ class MicrogliaPruningSystem:
         all_masks = []
         layers = self.get_layers()
         for layer in layers:
-            if hasattr(layer.self_attn, 'last_masks') and layer.self_attn.last_masks is not None:
-                all_masks.append(layer.self_attn.last_masks)
+            attn = getattr(layer, "self_attn", getattr(layer, "attn", None))
+            if hasattr(attn, 'last_masks') and attn.last_masks is not None:
+                all_masks.append(attn.last_masks)
         
         if not all_masks:
             return 0.0
@@ -673,6 +692,26 @@ class MicrogliaPruningSystem:
 
         if 'agents' not in checkpoint:
             raise KeyError("Checkpoint missing 'agents'. Fix by: load a valid microglia checkpoint.")
+
+        # Determine if we need to re-initialize agents due to hidden_dim mismatch
+        fc1_weight_key = next((k for k in checkpoint['agents'] if k.endswith('fc1.weight')), None)
+        if fc1_weight_key:
+            ckpt_hidden_dim = checkpoint['agents'][fc1_weight_key].shape[0]
+            current_hidden_dim = self.agents[0].fc1.out_features
+            if ckpt_hidden_dim != current_hidden_dim:
+                print(f"Hidden dimension mismatch: checkpoint has {ckpt_hidden_dim}, system has {current_hidden_dim}.")
+                print(f"Re-initializing agents with hidden_dim={ckpt_hidden_dim}...")
+                total_layers = len(self.get_layers())
+                self.agents = nn.ModuleList([
+                    MicrogliaAgent(ckpt_hidden_dim, self.num_heads, self.temperature, num_layers=total_layers, layer_idx=layer_idx)
+                    for layer_idx in range(total_layers)
+                ])
+                self.agents.to(self.device)
+                # Re-wrap if already wrapped to use new agents
+                if self.wrapped:
+                    self.wrapped = False
+                    self._wrap_attention_layers()
+
         self.agents.load_state_dict(checkpoint['agents'], strict=False)
         self.training_history = checkpoint.get('training_history', [])
 
@@ -690,9 +729,10 @@ class MicrogliaPruningSystem:
             if 'lora' in checkpoint:
                 self.model.load_state_dict(checkpoint['lora'], strict=False)
         elif 'lora' in checkpoint and not self.lora_applied:
-            raise ValueError(
-                "Checkpoint contains LoRA weights but system has no LoRA adapters. Fix by: call _apply_lora() first or set load_lora=True after adapters are created."
-            )
+            # Auto-apply LoRA if checkpoint contains it
+            print("Checkpoint contains LoRA weights. Automatically applying LoRA adapters...")
+            self._apply_lora()
+            self.model.load_state_dict(checkpoint['lora'], strict=False)
 
         if optimizer is not None and 'optimizer' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
