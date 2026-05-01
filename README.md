@@ -109,10 +109,16 @@ We provide three interactive notebooks:
 - Publication-ready figures (300 DPI)
 - **Recommended for paper submissions**
 
+**4. Qwen2.5 Evaluation** (⏱️ 20-30 min) - [Open in Colab](https://colab.research.google.com/github/Tommaso-R-Marena/microglia-pruning/blob/main/notebooks/qwen_pruning_eval.ipynb)
+- Evaluate on state-of-the-art Qwen2.5-3B-Instruct
+- Demonstrate cross-family model support
+- Fast training and evaluation on GSM8K
+
 **Choose based on your goal:**
 - Learning the system → Quick Demo
 - Validating results → Rigorous Experiment
 - Full paper results → Complete Pipeline ⭐
+- State-of-the-art 3B evaluation → Qwen2.5 Evaluation
 
 ### Python API
 
