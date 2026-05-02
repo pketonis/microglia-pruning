@@ -31,10 +31,9 @@ def compute_pruning_loss(
     """
     sparsity_loss = masks.mean()
 
-    eps = 1e-10
-    mask_entropy = -(
-        masks * (masks + eps).log() + (1 - masks) * (1 - masks + eps).log()
-    ).mean()
+    # Binary entropy of the masks to encourage them towards 0 or 1
+    # Use torch.special.entr for better performance and stability
+    mask_entropy = (torch.special.entr(masks) + torch.special.entr(1 - masks)).mean()
 
     if layer_sparsity_targets is not None:
         layer_targets = layer_sparsity_targets.to(device=masks.device, dtype=masks.dtype)

@@ -101,15 +101,13 @@ def compute_layer_stats(
     act_norms_std = norms.std(dim=1)
 
     # Statistic 3: Attention entropy per head
-    # Add small epsilon to avoid log(0)
-    attn_probs = attn_weights + 1e-10
-    
-    # Compute entropy: -sum(p * log(p))
+    # Use torch.special.entr for better performance and stability
     # Shape: (batch, num_heads, seq_len, seq_len) -> (batch, num_heads)
-    entropy = -(attn_probs * attn_probs.log()).sum(dim=-1).mean(dim=-1)
+    entropy = torch.special.entr(attn_weights).sum(dim=-1).mean(dim=-1)
     
     # Statistic 4: Max attention per head
-    max_attn = attn_weights.max(dim=-1)[0].mean(dim=-1)
+    # Use torch.amax to avoid unnecessary index computation
+    max_attn = torch.amax(attn_weights, dim=-1).mean(dim=-1)
 
     gradient_magnitude = _compute_gradient_magnitude(attn_weights, task_loss=task_loss, attn_grads=attn_grads)
     cross_head_corr = _compute_cross_head_correlation(hidden_states_heads)
