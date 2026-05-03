@@ -47,6 +47,12 @@ MODEL_REGISTRY: Dict[str, ModelSpec] = {
         num_layers=36,
         description="Qwen2.5 3B instruction-tuned model for high-performance reasoning.",
     ),
+    "qwen3-4b": ModelSpec(
+        name="Qwen/Qwen3-4B-Instruct-2507",
+        num_heads=32,
+        num_layers=36,
+        description="Qwen3 4B instruction-tuned model, representing the next generation of open-source models.",
+    ),
 }
 
 MODEL_ALIASES: Dict[str, str] = {
@@ -55,9 +61,10 @@ MODEL_ALIASES: Dict[str, str] = {
     "llama3": "llama3-8b",
     "llama-3": "llama3-8b",
     "mistral": "mistral-7b",
-    "qwen": "qwen2.5-3b",
+    "qwen": "qwen3-4b",
     "qwen2.5": "qwen2.5-3b",
     "qwen-3b": "qwen2.5-3b",
+    "qwen3": "qwen3-4b",
 }
 
 
