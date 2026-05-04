@@ -360,7 +360,14 @@ class MicrogliaPruningSystem:
         total_tokenized_examples = 0
         batch_size_preprocess = 100
 
-        pad_token_id = self.tokenizer.pad_token_id
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+            pad_token_id = eos_token_id if eos_token_id is not None else 0
+            self.logger.warning(
+                "Tokenizer is missing pad_token_id; falling back to "
+                f"{pad_token_id} for padding-label masking."
+            )
 
         for i in range(0, len(train_subset), batch_size_preprocess):
             batch = train_subset[i:i+batch_size_preprocess]
