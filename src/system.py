@@ -64,6 +64,20 @@ def _sanitize_rope_scaling(config, logger=None) -> None:
         config.rope_scaling = None
 
 
+def _mask_labels_for_padding(input_ids: torch.Tensor, pad_token_id: int) -> torch.Tensor:
+    """Return a labels tensor with pad positions replaced by -100.
+
+    HuggingFace CausalLM models pass labels directly to cross-entropy.
+    Padding positions must be set to -100 (the ignore_index) so they are
+    excluded from the loss — otherwise NaN propagates whenever a batch row
+    is dominated by pad tokens (common with short sequences and large
+    max_length).
+    """
+    labels = input_ids.clone()
+    labels[labels == pad_token_id] = -100
+    return labels
+
+
 class MicrogliaPruningSystem:
     """Orchestrator for the Microglia-inspired dynamic pruning system."""
 
@@ -346,6 +360,8 @@ class MicrogliaPruningSystem:
         total_tokenized_examples = 0
         batch_size_preprocess = 100
 
+        pad_token_id = self.tokenizer.pad_token_id
+
         for i in range(0, len(train_subset), batch_size_preprocess):
             batch = train_subset[i:i+batch_size_preprocess]
             prompts = [
@@ -398,7 +414,7 @@ class MicrogliaPruningSystem:
         if precision not in {'fp32', 'fp16', 'bf16'}:
             raise ValueError("precision must be one of {'fp32', 'fp16', 'bf16'}")
         amp_dtype = {'fp16': torch.float16, 'bf16': torch.bfloat16, 'fp32': torch.float32}[precision]
-        scaler = torch.cuda.amp.GradScaler(enabled=(precision == 'fp16' and torch.cuda.is_available()))
+        scaler = torch.amp.GradScaler('cuda', enabled=(precision == 'fp16' and torch.cuda.is_available()))
 
         self.logger.info(f"\nTraining for {num_epochs} epochs...")
         self.logger.info(f"Alpha schedule ({alpha_schedule_type}): {alpha_min} -> {alpha_max}\n")
@@ -419,6 +435,10 @@ class MicrogliaPruningSystem:
             for step, batch in enumerate(progress_bar):
                 batch = {k: v.to(self.device) for k, v in batch.items()}
 
+                # Mask pad positions in labels so cross-entropy ignores them.
+                # Without this, loss over all-pad rows produces NaN.
+                labels = _mask_labels_for_padding(batch['input_ids'], pad_token_id)
+
                 if use_budget:
                     prompt_preview = self.tokenizer.decode(batch["input_ids"][0], skip_special_tokens=True)
                     keep_ratio = self.budget_controller.compute_keep_ratio(prompt_preview)
@@ -436,7 +456,11 @@ class MicrogliaPruningSystem:
                     )
                 )
                 with amp_context:
-                    outputs = self.model(**batch, labels=batch['input_ids'])
+                    outputs = self.model(
+                        input_ids=batch['input_ids'],
+                        attention_mask=batch['attention_mask'],
+                        labels=labels,
+                    )
                     task_loss = outputs.loss
 
                 all_masks = []
@@ -486,7 +510,7 @@ class MicrogliaPruningSystem:
             self.logger.info(f"  LR: {scheduler.get_last_lr()[0]:.2e}")
             self.training_history.append(avg_metrics)
 
-            # Validation
+            # Validation — also mask labels to avoid NaN val loss
             self.model.eval()
             val_loss = 0
             val_steps = 0
@@ -497,9 +521,15 @@ class MicrogliaPruningSystem:
                     inputs = self.tokenizer(
                         prompt, return_tensors="pt", truncation=True, max_length=max_length
                     ).to(self.device)
-                    outputs = self.model(**inputs, labels=inputs['input_ids'])
-                    val_loss += outputs.loss.item()
-                    val_steps += 1
+                    val_labels = _mask_labels_for_padding(inputs['input_ids'], pad_token_id)
+                    outputs = self.model(
+                        input_ids=inputs['input_ids'],
+                        attention_mask=inputs['attention_mask'],
+                        labels=val_labels,
+                    )
+                    if not torch.isnan(outputs.loss):
+                        val_loss += outputs.loss.item()
+                        val_steps += 1
 
             avg_val_loss = val_loss / val_steps if val_steps > 0 else float('inf')
             self.logger.info(f"  Validation Loss: {avg_val_loss:.4f}")
@@ -670,7 +700,26 @@ class MicrogliaPruningSystem:
     # ------------------------------------------------------------------
 
     def _extract_answer(self, text: str) -> Optional[float]:
-        """Extract a numerical answer from model output or gold text."""
+        """Extract a numerical answer from model output or gold text.
+
+        Handles:
+          - GSM8K gold delimiter (####)
+          - Qwen3 / DeepSeek thinking-model output (<think>...</think> blocks)
+          - Bold markdown final answer (**42**)
+          - LaTeX boxed answer (\\boxed{42})
+          - Natural language triggers ("the answer is", "= ", etc.)
+          - Last-number fallback
+        """
+        # Strip Qwen3 / DeepSeek-style thinking traces before extraction.
+        # The model wraps its reasoning in <think>...</think>; the actual
+        # answer appears after </think>. If we search the full string we
+        # pick up numbers from the reasoning steps instead.
+        think_end = text.rfind('</think>')
+        if think_end != -1:
+            text = text[think_end + len('</think>'):]
+        # Also strip any residual <think> opening that was never closed
+        text = re.sub(r'<think>.*', '', text, flags=re.DOTALL)
+
         cleaned = text.replace(',', '')
         unit_pattern = r"\b(?:dollars?|cents?|miles?|kg|students?|apples?|days?|hours?|minutes?|years?|meters?|feet|pounds?)\b"
 
@@ -695,7 +744,22 @@ class MicrogliaPruningSystem:
             if value is not None:
                 return value
 
-        # 2. Natural-language triggers
+        # 2. LaTeX boxed answer: \boxed{42}  (DeepSeek, some Qwen outputs)
+        boxed_match = re.search(r'\\boxed\{([^}]+)\}', cleaned)
+        if boxed_match:
+            value = _first_number(boxed_match.group(1))
+            if value is not None:
+                return value
+
+        # 3. Bold markdown final answer: **42**  (Qwen3 instruct style)
+        bold_match = re.search(r'\*\*(-?\d+(?:\.\d+)?)\*\*', cleaned)
+        if bold_match:
+            try:
+                return float(bold_match.group(1))
+            except ValueError:
+                pass
+
+        # 4. Natural-language triggers
         triggers = ["the answer is", "= ", "equals ", "therefore"]
         lowered = cleaned.lower()
         for trigger in triggers:
@@ -705,14 +769,14 @@ class MicrogliaPruningSystem:
                 if value is not None:
                     return value
 
-        # 3. Last "Answer:" marker (handles echoed prompts)
+        # 5. Last "Answer:" marker (handles echoed prompts)
         answer_idx = lowered.rfind("answer:")
         if answer_idx != -1:
             value = _first_number(cleaned[answer_idx + len("answer:"):])
             if value is not None:
                 return value
 
-        # 4. Last number fallback
+        # 6. Last number fallback
         numbers = re.findall(r"-?\d+(?:\.\d+)?", _clean_segment(cleaned))
         if numbers:
             try:
