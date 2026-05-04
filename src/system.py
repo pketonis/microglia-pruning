@@ -27,6 +27,43 @@ from .budget import DynamicPruningBudget
 from .model_registry import resolve_model_spec
 
 
+def _sanitize_rope_scaling(config, logger=None) -> None:
+    """Null out a malformed rope_scaling dict in-place.
+
+    Phi-3 (and several other HuggingFace models) ship with a rope_scaling
+    config that is missing the required 'type' key. Their custom modeling
+    code reads config.rope_scaling['type'] directly inside __init__, which
+    raises a KeyError before from_pretrained even returns. Setting the
+    attribute to None is the safest fix — the model falls back to standard
+    RoPE.
+
+    We skip this sanitization for models that use the newer rope_parameters
+    field (e.g. Qwen3), where modifying rope_scaling would corrupt the setup.
+    """
+    uses_rope_parameters = (
+        hasattr(config, 'rope_parameters') and config.rope_parameters is not None
+    )
+    if uses_rope_parameters:
+        return
+
+    if not (hasattr(config, 'rope_scaling') and config.rope_scaling is not None):
+        return
+
+    if not isinstance(config.rope_scaling, dict):
+        return
+
+    rope_type = config.rope_scaling.get('type') or config.rope_scaling.get('rope_type')
+    valid_types = {'linear', 'dynamic', 'longrope', 'yarn', 'su', 'llama3'}
+
+    if rope_type is None or rope_type not in valid_types:
+        if logger:
+            logger.warning(
+                f"rope_scaling has unsupported/missing type '{rope_type}' — "
+                "setting rope_scaling=None so model falls back to standard RoPE."
+            )
+        config.rope_scaling = None
+
+
 class MicrogliaPruningSystem:
     """Orchestrator for the Microglia-inspired dynamic pruning system."""
 
@@ -60,30 +97,38 @@ class MicrogliaPruningSystem:
 
             config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
 
-            # Fix rope_scaling for older models with malformed dicts.
-            # Skip for models that use the newer rope_parameters field (e.g. Qwen3).
-            uses_rope_parameters = hasattr(config, 'rope_parameters') and config.rope_parameters is not None
-            if not uses_rope_parameters and hasattr(config, 'rope_scaling') and config.rope_scaling is not None:
-                if isinstance(config.rope_scaling, dict):
-                    if 'type' not in config.rope_scaling:
-                        config.rope_scaling = None
-                        self.logger.warning("Disabled rope_scaling (missing type)")
-                    elif config.rope_scaling.get('type') not in ['linear', 'dynamic', 'longrope']:
-                        config.rope_scaling = None
+            # Patch malformed rope_scaling before it reaches model __init__.
+            # Must be done on the config object itself — mutating it after
+            # from_pretrained is too late for models with custom modeling code.
+            _sanitize_rope_scaling(config, self.logger)
 
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
+            load_kwargs = dict(
                 config=config,
                 device_map="auto",
                 torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
                 attn_implementation="eager",
-                trust_remote_code=True
+                trust_remote_code=True,
             )
+
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+            except (KeyError, ValueError) as exc:
+                # Belt-and-suspenders: if the model's custom __init__ still
+                # trips on rope_scaling (e.g. because it re-reads the raw
+                # HuggingFace config cache), retry with rope_scaling disabled.
+                self.logger.warning(
+                    f"from_pretrained raised {type(exc).__name__}: {exc}. "
+                    "Retrying with rope_scaling explicitly disabled on config."
+                )
+                config.rope_scaling = None
+                # Some models also expose this via model_kwargs
+                load_kwargs["rope_scaling"] = None
+                self.model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
 
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
-            if 'phi-3' in model_name.lower():
-                self.logger.info("Fixing Phi-3 EOS token issue...")
+            if 'phi-3' in model_name.lower() or 'phi3' in model_name.lower():
+                self.logger.info("Applying Phi-3 EOS/PAD token fix...")
                 self.tokenizer.eos_token = "<|end|>"
                 self.tokenizer.pad_token = "<|end|>"
                 eos_id = self.tokenizer.convert_tokens_to_ids("<|end|>")
@@ -92,16 +137,15 @@ class MicrogliaPruningSystem:
                 if hasattr(self.model, 'generation_config'):
                     self.model.generation_config.eos_token_id = eos_id
                     self.model.generation_config.pad_token_id = eos_id
-                self.logger.info(f"Set EOS token to '<|end|>' (ID: {eos_id})")
+                self.logger.info(f"Set EOS/PAD token to '<|end|>' (ID: {eos_id})")
             else:
                 if self.tokenizer.pad_token is None:
                     self.tokenizer.pad_token = self.tokenizer.eos_token
                     self.model.config.pad_token_id = self.tokenizer.eos_token_id
 
-            # Detect whether this tokenizer supports a chat template.
-            # Instruct/chat models (Phi-3-Instruct, Qwen3-Instruct, Llama-Instruct, etc.)
-            # require apply_chat_template to produce coherent outputs. Base models fall
-            # back to a plain "Question / Answer" format.
+            # Detect whether this tokenizer has a chat template.
+            # Instruct models (Phi-3-Instruct, Qwen-Instruct, Llama-Instruct)
+            # require apply_chat_template to produce coherent outputs.
             self._has_chat_template = (
                 hasattr(self.tokenizer, 'apply_chat_template')
                 and self.tokenizer.chat_template is not None
@@ -144,24 +188,7 @@ class MicrogliaPruningSystem:
     # ------------------------------------------------------------------
 
     def _format_prompt(self, question: str, include_answer_prefix: bool = True) -> str:
-        """Format a GSM8K question into the correct prompt string for this model.
-
-        For instruct/chat models that expose a chat_template the tokenizer's
-        apply_chat_template is used, which is the only way to obtain coherent
-        outputs from models like Phi-3-Mini-Instruct or Qwen3-Instruct.
-
-        For base models (no chat template) we fall back to the plain
-        ``Question: ...\nAnswer:`` format.
-
-        Args:
-            question: The raw GSM8K question text.
-            include_answer_prefix: When True (inference), adds a trailing
-                ``add_generation_prompt`` so the model knows to start answering.
-                Set False for training where the full Q+A is tokenized together.
-
-        Returns:
-            Formatted prompt string ready for the tokenizer.
-        """
+        """Format a GSM8K question into the correct prompt string for this model."""
         if self._has_chat_template:
             messages = [{"role": "user", "content": f"Solve this math problem step by step.\n\n{question}"}]
             return self.tokenizer.apply_chat_template(
@@ -170,17 +197,10 @@ class MicrogliaPruningSystem:
                 add_generation_prompt=include_answer_prefix
             )
         else:
-            if include_answer_prefix:
-                return f"Question: {question}\nAnswer:"
-            else:
-                return f"Question: {question}\nAnswer:"
+            return f"Question: {question}\nAnswer:"
 
     def _format_train_sample(self, question: str, answer: str) -> str:
-        """Format a full Q+A pair for training (teacher-forcing).
-
-        For chat models, wraps the answer in an assistant turn so the model
-        is trained on the correct response format.
-        """
+        """Format a full Q+A pair for training (teacher-forcing)."""
         if self._has_chat_template:
             messages = [
                 {"role": "user", "content": f"Solve this math problem step by step.\n\n{question}"},
@@ -328,7 +348,6 @@ class MicrogliaPruningSystem:
 
         for i in range(0, len(train_subset), batch_size_preprocess):
             batch = train_subset[i:i+batch_size_preprocess]
-            # Use chat template for instruct models, plain text for base models
             prompts = [
                 self._format_train_sample(q, a)
                 for q, a in zip(batch['question'], batch['answer'])
@@ -519,19 +538,7 @@ class MicrogliaPruningSystem:
                  budget_keep_ratio: Optional[float] = None,
                  apply_chat_template: bool = True,
                  **kwargs):
-        """Generate text with optional pruning.
-
-        Args:
-            prompt: Raw question text OR a pre-formatted string.
-                If ``apply_chat_template=True`` (default) and this tokenizer
-                has a chat template, the prompt is treated as a plain question
-                and wrapped automatically.  Pass ``apply_chat_template=False``
-                if you have already formatted the string yourself.
-            max_new_tokens: Maximum tokens to generate.
-            use_pruning: Override pruning on/off.  Defaults to current state.
-            budget_keep_ratio: Override keep-ratio budget.
-            apply_chat_template: Whether to apply the model's chat template.
-        """
+        """Generate text with optional pruning."""
         if self.tokenizer is None:
             raise ValueError("No tokenizer available")
 
@@ -547,7 +554,6 @@ class MicrogliaPruningSystem:
 
         self.model.eval()
 
-        # Format prompt using the correct template for this model
         if apply_chat_template:
             formatted = self._format_prompt(prompt, include_answer_prefix=True)
         else:
@@ -602,7 +608,6 @@ class MicrogliaPruningSystem:
 
         with torch.no_grad():
             for example in progress_bar:
-                # generate() now applies the chat template automatically
                 output = self.generate(example['question'], max_new_tokens=256)
 
                 gold_answer = self._extract_answer(example['answer'])
