@@ -91,6 +91,20 @@ class TestSystemIntegration:
             from src.pruned_attention import PrunedAttention
             assert isinstance(layer.self_attn, PrunedAttention)
 
+    def test_extract_answer_robustness(self):
+        """Test robust numerical answer extraction across common output formats."""
+        fake_model = FakeModel(num_layers=2, hidden_dim=64, num_heads=4)
+        system = MicrogliaPruningSystem(model=fake_model, num_heads=4, hidden_dim=32, device='cpu')
+
+        assert system._extract_answer("the answer is 42 students") == 42.0
+        assert system._extract_answer("#### 100") == 100.0
+        assert system._extract_answer("so there are 3.5 times as many, meaning 7 total") == 7.0
+        assert system._extract_answer("no numbers here") is None
+        assert system._extract_answer("$1,234.56 dollars") == 1234.56
+        assert system._extract_answer(
+            "Question: If 3+4?\nAnswer: let's think. 3 and 4 make 7.\nAnswer: 7"
+        ) == 7.0
+
     def test_generate_toggles_pruning(self):
         """Test that generate method correctly toggles pruning state."""
         fake_model = FakeModel(num_layers=2, hidden_dim=64, num_heads=4)

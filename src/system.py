@@ -61,6 +61,10 @@ class MicrogliaPruningSystem:
         self.current_masks = {}
         self.pruning_enabled = False
         self.logger = setup_logging("MicrogliaSystem")
+        self.seed = seed
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
         
         self.logger.info(f"Initializing MicrogliaPruningSystem on {device}...")
         
@@ -243,7 +247,9 @@ class MicrogliaPruningSystem:
              val_split: float = 0.1,
              early_stopping_patience: int = 3,
              precision: str = "fp32",
-             use_budget: bool = True):
+             use_budget: bool = True,
+             max_val_samples: int = 50,
+             max_length: int = 256):
         """Train the pruning agents on a reasoning dataset with validation and checkpointing.
 
         Args:
@@ -259,6 +265,8 @@ class MicrogliaPruningSystem:
             early_stopping_patience: Number of epochs to wait for validation improvement.
             precision: Mixed precision mode in {'fp32', 'fp16', 'bf16'}.
             use_budget: Use DynamicPruningBudget-generated keep ratios during training.
+            max_val_samples: Maximum number of validation samples to evaluate per epoch.
+            max_length: Tokenization max length for training/validation prompts.
         """
         self.logger.info("\n" + "="*60)
         self.logger.info("Starting Training")
@@ -298,7 +306,7 @@ class MicrogliaPruningSystem:
         # Split into train and val
         indices = list(range(total_samples))
         import random
-        random.shuffle(indices)
+        random.Random(self.seed if hasattr(self, 'seed') else 42).shuffle(indices)
         split_idx = int(total_samples * (1 - val_split))
         train_indices = indices[:split_idx]
         val_indices = indices[split_idx:]
@@ -308,6 +316,8 @@ class MicrogliaPruningSystem:
         
         # Process in batches to avoid OOM
         processed_examples = []
+        truncated_examples = 0
+        total_tokenized_examples = 0
         batch_size_preprocess = 100
         
         for i in range(0, len(train_subset), batch_size_preprocess):
@@ -320,9 +330,13 @@ class MicrogliaPruningSystem:
                 prompts,
                 truncation=True,
                 padding='max_length',
-                max_length=128,
+                max_length=max_length,
                 return_tensors='pt'
             )
+
+            attention_mask = encoded['attention_mask']
+            total_tokenized_examples += attention_mask.size(0)
+            truncated_examples += int((attention_mask.sum(dim=1) >= max_length).sum().item())
             
             for j in range(len(prompts)):
                 processed_examples.append({
@@ -345,6 +359,12 @@ class MicrogliaPruningSystem:
         
         train_dataset = SimpleDataset(processed_examples)
         self.logger.info(f"Prepared {len(train_dataset)} training examples")
+        if total_tokenized_examples > 0:
+            truncation_fraction = truncated_examples / total_tokenized_examples
+            if truncation_fraction > 0.1:
+                self.logger.warning(
+                    f"WARNING: {truncation_fraction * 100:.1f}% of training examples were truncated at max_length={max_length}. Consider increasing max_length."
+                )
         
         self.logger.info("\nSetting up optimizer and scheduler for pruning agents...")
         optimizer = torch.optim.AdamW(
@@ -387,7 +407,7 @@ class MicrogliaPruningSystem:
             )
             
             progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
-            
+            actual_steps = 0
             for step, batch in enumerate(progress_bar):
                 batch = {k: v.to(self.device) for k, v in batch.items()}
 
@@ -444,18 +464,18 @@ class MicrogliaPruningSystem:
                         'loss': f"{total_loss.item():.3f}",
                         'sparsity': f"{loss_dict['sparsity_loss']:.3f}"
                     })
+                    actual_steps += 1
                 
                 if step % 10 == 0:
                     torch.cuda.empty_cache()
                 
-                if step >= max_steps_per_epoch:
+                if step + 1 >= max_steps_per_epoch:
                     break
             
             # Update learning rate
             scheduler.step()
 
-            n_steps = min(len(train_loader), max_steps_per_epoch)
-            avg_metrics = {k: v/n_steps for k, v in epoch_metrics.items()}
+            avg_metrics = {k: v/max(actual_steps, 1) for k, v in epoch_metrics.items()}
             self.logger.info(f"Epoch {epoch+1} Summary:")
             self.logger.info(f"  Task Loss: {avg_metrics['task_loss']:.4f}")
             self.logger.info(f"  Sparsity Loss: {avg_metrics['sparsity_loss']:.4f}")
@@ -469,10 +489,10 @@ class MicrogliaPruningSystem:
             val_loss = 0
             val_steps = 0
             with torch.no_grad():
-                for i in range(min(5, len(val_subset))):
+                for i in range(min(max_val_samples, len(val_subset))):
                     item = val_subset[i]
                     prompt = f"Question: {item['question']}\nAnswer: {item['answer']}"
-                    inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=128).to(self.device)
+                    inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length).to(self.device)
                     outputs = self.model(**inputs, labels=inputs['input_ids'])
                     val_loss += outputs.loss.item()
                     val_steps += 1
@@ -652,11 +672,49 @@ class MicrogliaPruningSystem:
     
     def _extract_answer(self, text: str) -> Optional[float]:
         """Extract numerical answer from text."""
-        if '####' in text:
-            text = text.split('####')[1]
-        
-        numbers = re.findall(r'-?\d+\.?\d*', text.replace(',', ''))
-        
+        cleaned = text.replace(',', '')
+        unit_pattern = r"\b(?:dollars?|cents?|miles?|kg|students?|apples?|days?|hours?|minutes?|years?|meters?|feet|pounds?)\b"
+
+        def _clean_segment(segment: str) -> str:
+            segment = re.sub(r"[$£€%]", "", segment)
+            segment = re.sub(unit_pattern, "", segment, flags=re.IGNORECASE)
+            return segment
+
+        def _first_number(segment: str) -> Optional[float]:
+            segment = _clean_segment(segment)
+            match = re.search(r"-?\d+(?:\.\d+)?", segment)
+            if not match:
+                return None
+            try:
+                return float(match.group(0))
+            except ValueError:
+                return None
+
+        if '####' in cleaned:
+            after_delimiter = cleaned.split('####', 1)[1]
+            value = _first_number(after_delimiter)
+            if value is not None:
+                return value
+
+        triggers = ["the answer is", "= ", "equals ", "therefore"]
+        lowered = cleaned.lower()
+        for trigger in triggers:
+            idx = lowered.find(trigger)
+            if idx != -1:
+                value = _first_number(cleaned[idx + len(trigger):])
+                if value is not None:
+                    return value
+
+        # Handle echoed prompts like "Question: ...\nAnswer:" by preferring
+        # the final answer marker rather than the first prompt-level marker.
+        answer_idx = lowered.rfind("answer:")
+        if answer_idx != -1:
+            value = _first_number(cleaned[answer_idx + len("answer:"):])
+            if value is not None:
+                return value
+
+        fallback_segment = _clean_segment(cleaned)
+        numbers = re.findall(r"-?\d+(?:\.\d+)?", fallback_segment)
         if numbers:
             try:
                 return float(numbers[-1])
