@@ -696,7 +696,7 @@ class MicrogliaPruningSystem:
             if value is not None:
                 return value
 
-        triggers = ["the answer is", "= ", "equals ", "answer:", "therefore"]
+        triggers = ["the answer is", "= ", "equals ", "therefore"]
         lowered = cleaned.lower()
         for trigger in triggers:
             idx = lowered.find(trigger)
@@ -704,6 +704,14 @@ class MicrogliaPruningSystem:
                 value = _first_number(cleaned[idx + len(trigger):])
                 if value is not None:
                     return value
+
+        # Handle echoed prompts like "Question: ...\nAnswer:" by preferring
+        # the final answer marker rather than the first prompt-level marker.
+        answer_idx = lowered.rfind("answer:")
+        if answer_idx != -1:
+            value = _first_number(cleaned[answer_idx + len("answer:"):])
+            if value is not None:
+                return value
 
         fallback_segment = _clean_segment(cleaned)
         numbers = re.findall(r"-?\d+(?:\.\d+)?", fallback_segment)

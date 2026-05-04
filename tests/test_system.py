@@ -101,6 +101,9 @@ class TestSystemIntegration:
         assert system._extract_answer("so there are 3.5 times as many, meaning 7 total") == 7.0
         assert system._extract_answer("no numbers here") is None
         assert system._extract_answer("$1,234.56 dollars") == 1234.56
+        assert system._extract_answer(
+            "Question: If 3+4?\nAnswer: let's think. 3 and 4 make 7.\nAnswer: 7"
+        ) == 7.0
 
     def test_generate_toggles_pruning(self):
         """Test that generate method correctly toggles pruning state."""
