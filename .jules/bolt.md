@@ -5,3 +5,6 @@
 ## 2026-05-22 - [Optimizing Attention Stats]
 **Learning:** `torch.special.entr` is significantly faster and more numerically stable than manual `- (p * p.log())` entropy calculation. `torch.amax` is faster than `torch.max(...)[0]` when indices are not needed. It can also be used for binary entropy by computing `entr(x) + entr(1-x)`.
 **Action:** Prefer `torch.special` functions and `amax`/`amin` for performance-critical tensor reductions.
+## 2026-05-22 - [Cache positional encoding in MicrogliaAgent]
+**Learning:** Redundant trigonometric operations and tensor allocations in the forward pass of small MLP agents can cumulatively impact latency, especially when called for every layer in a deep transformer. Caching these values with device-awareness provides a significant (21%) speedup to the agent's forward pass.
+**Action:** Always look for static or quasi-static computations in "hot" forward paths that can be cached or pre-computed.

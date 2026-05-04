@@ -68,12 +68,28 @@ class MicrogliaAgent(nn.Module):
         self.norm2: nn.LayerNorm = nn.LayerNorm(hidden_dim)
 
         self.positional_projection: nn.Linear = nn.Linear(2, hidden_dim)
+
+        # Performance optimization: cache positional encoding to avoid redundant trig ops
+        self._cached_pos_encoding: Optional[torch.Tensor] = None
+        self._cached_layer_idx: int = self.layer_idx
         
     def _layer_positional_encoding(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Create sinusoidal encoding from normalized layer position."""
-        position = torch.tensor(self.layer_idx / max(self.num_layers - 1, 1), device=device, dtype=torch.float32)
-        encoding = torch.stack([torch.sin(math.pi * position), torch.cos(math.pi * position)], dim=0)
-        return encoding.unsqueeze(0).expand(batch_size, -1)
+        """Create sinusoidal encoding from normalized layer position (cached)."""
+        if (
+            self._cached_pos_encoding is None
+            or self._cached_layer_idx != self.layer_idx
+            or self._cached_pos_encoding.device != device
+        ):
+            position = self.layer_idx / max(self.num_layers - 1, 1)
+            encoding = torch.tensor(
+                [math.sin(math.pi * position), math.cos(math.pi * position)],
+                device=device,
+                dtype=torch.float32
+            )
+            self._cached_pos_encoding = encoding
+            self._cached_layer_idx = self.layer_idx
+
+        return self._cached_pos_encoding.unsqueeze(0).expand(batch_size, -1)
 
     def forward(self, activation_stats: torch.Tensor, layer_idx: Optional[int] = None) -> torch.Tensor:
         """Predicts pruning masks from activation statistics.
