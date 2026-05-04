@@ -64,16 +64,25 @@ def _sanitize_rope_scaling(config, logger=None) -> None:
         config.rope_scaling = None
 
 
-def _mask_labels_for_padding(input_ids: torch.Tensor, pad_token_id: int) -> torch.Tensor:
-    """Return a labels tensor with pad positions replaced by -100.
+def _mask_labels_for_padding(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    pad_token_id: int | None = None,
+) -> torch.Tensor:
+    """Return labels with padding positions replaced by -100.
 
-    HuggingFace CausalLM models pass labels directly to cross-entropy.
-    Padding positions must be set to -100 (the ignore_index) so they are
-    excluded from the loss — otherwise NaN propagates whenever a batch row
-    is dominated by pad tokens (common with short sequences and large
-    max_length).
+    Prefer attention_mask when available so only true pad positions are
+    ignored, even if pad_token_id is unavailable or reused as a real token
+    (for example EOS fallback in mocked/custom tokenizers).
     """
     labels = input_ids.clone()
+    if attention_mask is not None:
+        labels = labels.masked_fill(attention_mask == 0, -100)
+        return labels
+
+    if pad_token_id is None:
+        raise ValueError("pad_token_id is required when attention_mask is None")
+
     labels[labels == pad_token_id] = -100
     return labels
 
@@ -360,7 +369,14 @@ class MicrogliaPruningSystem:
         total_tokenized_examples = 0
         batch_size_preprocess = 100
 
-        pad_token_id = self.tokenizer.pad_token_id
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+            pad_token_id = eos_token_id if eos_token_id is not None else 0
+            self.logger.warning(
+                "Tokenizer is missing pad_token_id; falling back to "
+                f"{pad_token_id} for padding-label masking."
+            )
 
         for i in range(0, len(train_subset), batch_size_preprocess):
             batch = train_subset[i:i+batch_size_preprocess]
@@ -437,7 +453,11 @@ class MicrogliaPruningSystem:
 
                 # Mask pad positions in labels so cross-entropy ignores them.
                 # Without this, loss over all-pad rows produces NaN.
-                labels = _mask_labels_for_padding(batch['input_ids'], pad_token_id)
+                labels = _mask_labels_for_padding(
+                    batch['input_ids'],
+                    attention_mask=batch['attention_mask'],
+                    pad_token_id=pad_token_id,
+                )
 
                 if use_budget:
                     prompt_preview = self.tokenizer.decode(batch["input_ids"][0], skip_special_tokens=True)
@@ -521,7 +541,11 @@ class MicrogliaPruningSystem:
                     inputs = self.tokenizer(
                         prompt, return_tensors="pt", truncation=True, max_length=max_length
                     ).to(self.device)
-                    val_labels = _mask_labels_for_padding(inputs['input_ids'], pad_token_id)
+                    val_labels = _mask_labels_for_padding(
+                        inputs['input_ids'],
+                        attention_mask=inputs['attention_mask'],
+                        pad_token_id=pad_token_id,
+                    )
                     outputs = self.model(
                         input_ids=inputs['input_ids'],
                         attention_mask=inputs['attention_mask'],
