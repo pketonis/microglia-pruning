@@ -76,8 +76,12 @@ class MicrogliaPruningSystem:
             
             config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
             
-            # Fix rope_scaling
-            if hasattr(config, 'rope_scaling') and config.rope_scaling is not None:
+            # Fix rope_scaling for older models that have a malformed rope_scaling dict.
+            # Skip this sanitization for models that use the newer rope_parameters field
+            # (e.g. Qwen3) — modifying rope_scaling on those architectures can corrupt
+            # rope_parameters and cause a TypeError at model init.
+            uses_rope_parameters = hasattr(config, 'rope_parameters') and config.rope_parameters is not None
+            if not uses_rope_parameters and hasattr(config, 'rope_scaling') and config.rope_scaling is not None:
                 if isinstance(config.rope_scaling, dict):
                     if 'type' not in config.rope_scaling:
                         config.rope_scaling = None
@@ -484,7 +488,7 @@ class MicrogliaPruningSystem:
             
             self.training_history.append(avg_metrics)
 
-            # Simple validation (using a small subset of val data)
+            # Validation loop
             self.model.eval()
             val_loss = 0
             val_steps = 0
