@@ -46,7 +46,7 @@ class PrunedAttention(nn.Module):
         self.budget_keep_ratio = keep_ratio
 
     def _apply_budget(self, masks: torch.Tensor) -> torch.Tensor:
-        """Project soft masks onto a fixed top-k support when budget is set."""
+        """Project masks onto a fixed top-k binary support when budget is set."""
         if self.budget_keep_ratio is None:
             return masks
 
@@ -54,12 +54,12 @@ class PrunedAttention(nn.Module):
         num_heads = masks.shape[1]
         keep_k = max(1, int(round(keep_ratio * num_heads)))
         if keep_k >= num_heads:
-            return masks
+            return torch.ones_like(masks)
 
         topk_indices = masks.topk(k=keep_k, dim=1).indices
         budget_mask = torch.zeros_like(masks)
         budget_mask.scatter_(1, topk_indices, 1.0)
-        return masks * budget_mask
+        return budget_mask
         
     def forward(self, 
                 hidden_states: torch.Tensor,
