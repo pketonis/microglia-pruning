@@ -106,6 +106,17 @@ class MicrogliaAgent(nn.Module):
         if layer_idx is not None:
             self.layer_idx = int(layer_idx)
 
+        activation_stats = torch.nan_to_num(
+            activation_stats.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        activation_stats = activation_stats.clamp(-1e4, 1e4)
+        stat_mean = activation_stats.mean(dim=-1, keepdim=True)
+        stat_std = activation_stats.std(dim=-1, keepdim=True).clamp_min(1e-6)
+        activation_stats = ((activation_stats - stat_mean) / stat_std).clamp(-10.0, 10.0)
+
         x = self.fc1(activation_stats)
 
         pos_encoding = self._layer_positional_encoding(activation_stats.shape[0], activation_stats.device)
