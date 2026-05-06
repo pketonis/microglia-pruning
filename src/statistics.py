@@ -82,6 +82,9 @@ def compute_layer_stats(
     if isinstance(hidden_states, tuple):
         hidden_states = hidden_states[0]
 
+    hidden_states = torch.nan_to_num(hidden_states, nan=0.0, posinf=0.0, neginf=0.0)
+    attn_weights = torch.nan_to_num(attn_weights, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+
     batch_size = hidden_states.shape[0]
     num_heads = attn_weights.shape[1]
     
