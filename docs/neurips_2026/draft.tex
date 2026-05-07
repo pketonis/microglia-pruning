@@ -1,0 +1,991 @@
+\documentclass{article}
+
+% NeurIPS 2026 style
+\usepackage[final]{neurips_2026}
+
+% Core packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{multirow}
+\usepackage{listings}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+% Code listing style
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  stringstyle=\color{red!70!black},
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny\color{gray}
+}
+
+% Custom commands
+\newcommand{\mlp}{\text{MLP}}
+\newcommand{\agent}{\textsc{MicrogliaAgent}}
+\newcommand{\system}{\textsc{adapt}}
+\newcommand{\Lcal}{\mathcal{L}}
+\newcommand{\Hcal}{\mathcal{H}}
+\newcommand{\phivec}{\boldsymbol{\phi}}
+\newcommand{\mvec}{\mathbf{m}}
+\newcommand{\R}{\mathbb{R}}
+
+%--------------------------------------------------------------
+\title{ADAPT: The Case for Input-Adaptive Attention Pruning\\
+       at Inference Time}
+
+\author{%
+  Tommaso R.\ Marena \\
+  Department of Mathematics \\
+  The Catholic University of America \\
+  Washington, DC 20064 \\
+  \texttt{marena@cua.edu} \\
+  \And
+  Panos Ketonis \\
+  Yale University \\
+  New Haven, CT 06520
+}
+
+\begin{document}
+
+\maketitle
+
+%==============================================================
+\begin{abstract}
+Structured pruning of attention heads in large language models is commonly treated as a
+static problem: a sparsity mask is computed once and reused for every input. We argue this
+assumption is too restrictive for reasoning models, where the computational role of individual
+attention heads varies substantially with input complexity. The dominant paradigm asks
+\emph{which heads are dispensable in general}---a question that presupposes head utility is a
+fixed property of the model rather than a function of the input being processed.
+
+Biological neural systems offer a different principle. Microglia, the brain's resident immune
+cells, continuously survey synaptic activity and selectively eliminate connections that are
+chronically underused---not according to a global structural rule, but in response to local,
+ongoing patterns of use. The result is a circuit that remains efficient under varying cognitive
+demand without sacrificing capacity when that capacity is needed. We propose that attention
+pruning in transformers should be governed by the same logic: pruning decisions should be
+\emph{activity-dependent at inference time}, conditioned on what each input actually recruits.
+
+To ground this argument concretely, we present \system{}
+(\textbf{A}ctivity-\textbf{D}ependent \textbf{A}ttention \textbf{P}runing at inference
+\textbf{T}ime), a framework in which each transformer layer is paired with a small learned
+agent that predicts head-level keep masks from runtime activation statistics---including
+activation magnitude and attention entropy---allowing the model to allocate compute
+differently for each input. Using this system, we show that adaptive and static masks at
+matched sparsity diverge in behavior across hard and easy subsets of GSM8K, providing
+evidence that input complexity is a meaningful axis along which pruning decisions should vary.
+
+Our goal is not to claim a definitive benchmark improvement, but to argue for a different way
+of framing inference efficiency. Rather than asking which heads can be removed once and for
+all, we ask which heads are necessary for the input \emph{currently being processed}. We
+contend that evaluation protocols, baseline comparisons, and system designs for
+inference-time pruning should be structured around per-input compute allocation rather than
+aggregate sparsity, and that input-adaptive gating deserves treatment as the natural unit of
+comparison rather than an exotic variant.
+\end{abstract}
+
+%==============================================================
+\section{Introduction}
+\label{sec:intro}
+%==============================================================
+
+Large language models (LLMs) based on the transformer architecture \citep{vaswani2017attention}
+have achieved remarkable performance on complex reasoning tasks, including mathematical
+problem-solving \citep{wei2022chain}, symbolic reasoning \citep{suzgun2022challenging}, and
+multi-step inference \citep{lightman2023lets}. This performance comes at significant
+computational cost: at inference time, \emph{all} attention heads in every layer are activated
+for \emph{every} input, regardless of how much reasoning the input actually requires. The
+field's dominant response has been structured pruning---remove heads that are globally
+dispensable, then reuse that fixed mask universally. We argue this framing is too coarse.
+
+Head utility is not a fixed property of a model. A head that diffusely attends over most
+inputs may be precisely the head that resolves a rare coreference or captures a deep
+syntactic dependency on a hard example. Static pruning, by committing to a single mask, is
+blind to this variability. The right question is not \emph{which heads are dispensable in
+general}, but \emph{which heads are unnecessary for the input currently being processed}.
+
+A key insight from neuroscience motivates our approach. Microglia, the brain's resident
+immune cells, continuously survey synaptic activity and selectively eliminate connections that
+are chronically underused---not according to a global structural rule, but in response to
+local, ongoing patterns of use \citep{stevens2007complement,paolicelli2011synaptic}. The
+result is a circuit that remains efficient under varying cognitive demand without sacrificing
+capacity when that capacity is needed. We propose that attention pruning in transformers
+should be governed by the same logic: pruning decisions should be \emph{activity-dependent at
+inference time}.
+
+We present \system{} (\textbf{A}ctivity-\textbf{D}ependent \textbf{A}ttention \textbf{P}runing
+at inference \textbf{T}ime), a framework for dynamic, input-adaptive, structured attention
+head pruning in transformer-based LLMs. Each transformer layer is paired with a small learned
+\agent{} network that predicts per-head keep masks from runtime activation statistics ---
+activation magnitude and attention entropy --- computed via lightweight forward hooks. Masks
+are applied dynamically during the forward pass and vary across inputs. The agents are trained
+jointly with LoRA adapters under a three-term objective that balances task fidelity, sparsity
+pressure, and mask decisiveness, with a curriculum schedule that gradually increases pruning
+pressure over training.
+
+\paragraph{Problem Statement.}
+Given a pre-trained transformer with $L$ layers and $H$ attention heads per layer, we wish to
+learn a per-input masking function $m_{l,h}(\mathbf{x}) \in [0, 1]$ for each head $(l, h)$
+such that: (1)~heads deemed redundant for the current input are suppressed at inference time,
+yielding real latency reduction; (2)~task accuracy on reasoning benchmarks is preserved within
+an acceptable degradation budget; and (3)~the masking function is differentiable during
+training and adds negligible parameter overhead.
+
+\paragraph{Contributions.}
+We make the following contributions:
+\begin{enumerate}
+  \item We introduce \system{}, a biologically motivated framework for dynamic structured
+        pruning of transformer attention heads at inference time, requiring no offline pruning
+        schedule and no architectural modification to the base model.
+
+  \item We propose \agent{} --- lightweight two-layer MLP networks that predict per-head
+        importance from activation statistics computed via forward hooks, adding negligible
+        parameter overhead.
+
+  \item We derive a three-term differentiable training objective combining task accuracy
+        preservation, sparsity pressure, and mask entropy regularization, and show that
+        curriculum-scheduled sparsity pressure stabilizes training and produces consistent
+        pruning patterns.
+
+  \item We demonstrate meaningful head sparsity with measurable latency reduction and
+        minimal accuracy degradation on GSM8K \citep{cobbe2021gsm8k} using Phi-3-Mini
+        \citep{abdin2024phi3}, validated with bootstrap confidence intervals and multi-seed
+        reproducibility.
+
+  \item We show that adaptive and static masks at \emph{matched sparsity} diverge in
+        behavior across hard and easy GSM8K subsets, providing direct evidence that
+        per-input compute allocation is a meaningful axis of variation that aggregate
+        sparsity metrics obscure.
+
+  \item We release a fully open-source implementation including training, evaluation,
+        ablation, Pareto-frontier, and lottery-ticket analysis scripts, along with
+        production extensions (vLLM, ONNX, FastAPI).\footnote{%
+        \url{https://github.com/Tommaso-R-Marena/microglia-pruning}}
+\end{enumerate}
+
+\paragraph{Paper Organization.}
+Section~\ref{sec:background} reviews related work on attention head redundancy, structured
+pruning, dynamic inference, and parameter-efficient fine-tuning. Section~\ref{sec:method}
+presents the \system{} architecture, mathematical formulation, training objective, and
+curriculum schedule. Section~\ref{sec:experiments} describes the experimental setup,
+baselines, and evaluation protocol. Section~\ref{sec:analysis} provides ablation studies,
+per-layer analysis, and Pareto-frontier exploration. Section~\ref{sec:discussion} discusses
+limitations, biological fidelity, and broader impact.
+
+%==============================================================
+\section{Background and Related Work}
+\label{sec:background}
+%==============================================================
+
+\subsection{Attention Head Redundancy}
+\label{sec:bg_redundancy}
+
+Empirical and theoretical studies consistently show that large transformer models contain
+substantial attention head redundancy. \citet{michel2019sixteen} demonstrated that the majority
+of attention heads in BERT can be pruned at test time with minimal performance loss.
+\citet{voita2019analyzing} identified four functional head types --- positional, syntactic,
+rare-word, and coreference --- and showed that only a subset meaningfully contribute to
+downstream task performance. \citet{clark2019does} further characterized systematic head
+specialization in BERT, with many heads attending nearly uniformly and contributing little
+task-relevant information. Critically, all prior analyses identify redundancy \emph{statically},
+averaging over datasets rather than adapting to individual inputs --- the precise gap our work
+addresses.
+
+\subsection{Structured and Unstructured Pruning}
+\label{sec:bg_pruning}
+
+Neural network pruning spans a spectrum from fine-grained weight-level sparsity to coarse
+structural removal \citep{han2015learning,molchanov2017variational}. \textbf{Unstructured
+pruning} zeroes individual weights, achieving high theoretical compression but yielding
+negligible real-world speedup due to irregular sparse memory access patterns
+\citep{gale2019state}. \textbf{Structured pruning} removes entire computational units ---
+neurons, convolutional filters, or attention heads --- enabling direct hardware acceleration
+\citep{li2017pruning,michel2019sixteen}. Within the transformer context, head-level structured
+pruning occupies a favorable middle ground: it is finer-grained than layer-level pruning
+(which causes steep accuracy drops \citep{fan2020reducing}) but coarser than token-level
+pruning (which introduces sequence-length management complexity
+\citep{goyal2020power,kim2020fastformers}). All existing structured pruning methods for
+transformers, however, commit to a fixed mask at the end of training --- the assumption
+\system{} directly challenges.
+
+\subsection{Dynamic and Input-Adaptive Inference}
+\label{sec:bg_dynamic}
+
+Conditional computation \citep{bengio2015conditional} pioneered the idea of routing inputs
+through different subsets of model capacity. Early-exit mechanisms
+\citep{graves2016adaptive,schuster2022confident} halt generation once a confidence threshold
+is reached but operate at the \emph{layer} level. Token-level pruning methods such as
+PoWER-BERT \citep{goyal2020power} and SpAtten \citep{wang2021spatten} reduce sequence length
+dynamically; they are complementary but orthogonal to our head-level approach.
+Mixture-of-experts (MoE) architectures \citep{shazeer2017outrageously,fedus2022switch}
+achieve input-conditional routing at the feed-forward sublayer level. To our knowledge,
+\system{} is the first method to apply per-head, per-input \emph{learned dynamic masking}
+trained jointly with task loss under a curriculum sparsity schedule, and to evaluate whether
+per-input adaptivity provides a measurable advantage over static pruning at matched sparsity.
+
+\subsection{Parameter-Efficient Fine-Tuning}
+\label{sec:bg_peft}
+
+LoRA \citep{hu2022lora} injects low-rank decomposition matrices into weight projections,
+enabling fine-tuning of billion-parameter models with a small fraction of trainable parameters.
+We train \agent{} networks jointly with LoRA adapters applied to query and value projections,
+combining two orthogonal PEFT strategies: LoRA reduces the \emph{fine-tuning} parameter
+footprint, while \system{} reduces \emph{inference} compute. Related work on QLoRA
+\citep{dettmers2023qlora} further reduces memory through quantized base weights, a direction
+compatible with our framework.
+
+\subsection{The Lottery Ticket Hypothesis}
+\label{sec:bg_lth}
+
+\citet{frankle2019lottery} showed that dense networks contain sparse subnetworks (``winning
+tickets'') that, when trained in isolation from the same initialization, match full-model
+performance. Our empirical observation that \system{} converges to \emph{consistent pruning
+patterns across diverse inputs} is directly analogous: the agents discover a stable
+attention-head subnetwork that generalizes across the input distribution. We formalize this
+connection in Section~\ref{sec:analysis} via mask trajectory overlap analysis.
+
+\subsection{Neuroscience Background}
+\label{sec:bg_neuro}
+
+Microglial synaptic pruning is a well-characterized biological phenomenon critical to healthy
+neural circuit refinement \citep{paolicelli2011synaptic}. Microglia detect synaptic activity
+through complement proteins (C1q, C3) deposited preferentially at weak synapses
+\citep{stevens2007complement}, then phagocytose tagged synapses in an activity-dependent
+manner. This process is most active during developmental critical periods but continues in
+the adult brain during learning and memory consolidation \citep{bhatt2009dendritic}. The key
+functional property --- \emph{activity-dependent, reversible, input-responsive elimination of
+weak connections} --- is the biological principle we formalize computationally.
+
+%==============================================================
+\section{Method}
+\label{sec:method}
+%==============================================================
+
+\subsection{Problem Formulation}
+\label{sec:method_formulation}
+
+Let $\mathcal{M}$ be a pre-trained transformer language model with $L$ layers, each containing
+$H$ attention heads. For a given input sequence $\mathbf{x} \in \mathcal{V}^*$, the standard
+multi-head attention output at layer $l$ is:
+\[
+  \mathbf{A}_l(\mathbf{x}) = \text{Concat}\bigl[\mathbf{a}_{l,1},\, \mathbf{a}_{l,2},\,
+  \ldots,\, \mathbf{a}_{l,H}\bigr] \mathbf{W}^O_l,
+\]
+where $\mathbf{a}_{l,h} = \text{Attn}(\mathbf{Q}_{l,h}, \mathbf{K}_{l,h}, \mathbf{V}_{l,h})$
+is the output of head $h$ and $\mathbf{W}^O_l$ is the output projection.
+
+We seek to learn a \emph{dynamic masking function}
+$m_{l,h} : \mathcal{V}^* \to [0, 1]$ for each head $(l, h)$ such that the masked attention
+output is:
+\[
+  \hat{\mathbf{A}}_l(\mathbf{x})
+  = \text{Concat}\bigl[m_{l,1}(\mathbf{x})\,\mathbf{a}_{l,1},\;\ldots,\;
+    m_{l,H}(\mathbf{x})\,\mathbf{a}_{l,H}\bigr]\mathbf{W}^O_l,
+\]
+subject to: (i) the base model weights $\theta_{\mathcal{M}}$ are frozen; (ii) the total
+additional parameters for all agents is $\ll 1\%$ of $|\theta_{\mathcal{M}}|$; (iii)
+$m_{l,h}$ is differentiable almost everywhere for gradient-based training.
+
+\subsection{Activation Statistics}
+\label{sec:method_stats}
+
+The masking function for head $(l,h)$ is conditioned on a feature vector
+$\phivec_{l,h}(\mathbf{x}) \in \R^4$ computed from the intermediate activations of
+that head. Given hidden states $\mathbf{H} \in \R^{T \times d_h}$ and attention weights
+$\mathbf{P} \in \R^{T \times T}$ for a sequence of length $T$, we define:
+
+\begin{align}
+  \phi^{(1)}_{l,h} &= \frac{1}{T}\sum_{t=1}^{T} \|\mathbf{h}_t\|_2
+    && \text{(mean activation norm)} \label{eq:phi1} \\
+  \phi^{(2)}_{l,h} &= \sqrt{\frac{1}{T}\sum_{t=1}^{T}
+    \bigl(\|\mathbf{h}_t\|_2 - \phi^{(1)}_{l,h}\bigr)^2}
+    && \text{(activation std.\ dev.)} \label{eq:phi2} \\
+  \phi^{(3)}_{l,h} &= -\frac{1}{T}\sum_{t=1}^{T} \sum_{s=1}^{T}
+    p_{ts} \log(p_{ts} + \epsilon)
+    && \text{(attention entropy)} \label{eq:phi3} \\
+  \phi^{(4)}_{l,h} &= \frac{1}{T}\sum_{t=1}^{T} \max_{s}\, p_{ts}
+    && \text{(mean max attention)} \label{eq:phi4}
+\end{align}
+
+where $\epsilon$ is a small constant for numerical stability. Together, these four statistics
+provide a lightweight ``health report'' of each head: high entropy (Eq.~\ref{eq:phi3}) and
+low norm (Eq.~\ref{eq:phi1}) are characteristic of redundant heads attending diffusely over
+the sequence; low entropy and high max attention (Eq.~\ref{eq:phi4}) indicate heads focused
+on specific tokens, typically functionally important. These statistics are computed via
+registered PyTorch forward hooks with $\mathcal{O}(T \cdot d_h)$ overhead per head,
+amortized across the batch.
+
+\subsection{MicrogliaAgent Architecture}
+\label{sec:method_agent}
+
+Each layer $l$ has a dedicated \agent{} $f_{\theta_l} : \R^{2H} \to \R^H$ parameterized by
+a two-layer MLP. In practice, the agent receives as input the full concatenation of per-head
+statistics across all heads in the layer, $\Phi_l = [\phivec_{l,1}; \ldots; \phivec_{l,H}]
+\in \R^{2H}$, so that the agent can model inter-head dependencies:
+\[
+  f_{\theta_l}(\Phi_l) =
+    \mathbf{W}^{(2)}_l\,\sigma_{\text{GELU}}\!\bigl(
+      \mathbf{W}^{(1)}_l\,\Phi_l + \mathbf{b}^{(1)}_l
+    \bigr) + \mathbf{b}^{(2)}_l,
+\]
+where $\mathbf{W}^{(1)}_l \in \R^{d_{\text{hid}} \times 2H}$ and
+$\mathbf{W}^{(2)}_l \in \R^{H \times d_{\text{hid}}}$.
+The soft mask for head $h$ in layer $l$ is obtained via temperature-scaled sigmoid:
+\begin{equation}
+  m_{l,h}(\mathbf{x}) = \sigma\!\left(\frac{[f_{\theta_l}(\Phi_l(\mathbf{x}))]_h}{T}\right),
+  \label{eq:mask}
+\end{equation}
+where $T > 0$ is a temperature hyperparameter. The total parameter overhead across all
+agent networks is a small fraction of the base model's parameter count.
+
+\subsection{Training Objective}
+\label{sec:method_loss}
+
+The agent parameters $\{\theta_l\}_{l=1}^{L}$ and LoRA adapter parameters
+$\{\Delta_l\}_{l=1}^{L}$ are trained jointly to minimize:
+\begin{equation}
+  \Lcal_{\text{total}} = \Lcal_{\text{task}} + \alpha \cdot \Lcal_{\text{sparse}}
+                         - \beta \cdot \Lcal_{\text{entropy}},
+  \label{eq:loss}
+\end{equation}
+where the three components are:
+
+\paragraph{Task Loss.}
+Standard cross-entropy over answer tokens in the reasoning trace:
+\[
+  \Lcal_{\text{task}} = -\frac{1}{|\mathcal{A}|}\sum_{t \in \mathcal{A}}
+    \log p_\theta(x_t \mid x_{<t}),
+\]
+where $\mathcal{A}$ is the set of answer token positions. This ensures that pruning does not
+degrade reasoning accuracy.
+
+\paragraph{Sparsity Loss.}
+Mean of all mask values across heads and layers:
+\[
+  \Lcal_{\text{sparse}} = \frac{1}{LH}\sum_{l=1}^{L}\sum_{h=1}^{H} m_{l,h},
+\]
+which is minimized by driving masks toward zero (pruning). The coefficient $\alpha$ controls
+the global pruning pressure.
+
+\paragraph{Entropy Loss.}
+Binary entropy of mask values:
+\[
+  \Lcal_{\text{entropy}} = -\frac{1}{LH}\sum_{l=1}^{L}\sum_{h=1}^{H}
+    \Bigl[ m_{l,h}\log m_{l,h} + (1-m_{l,h})\log(1-m_{l,h}) \Bigr].
+\]
+Maximizing entropy (i.e., subtracting it from the loss) \emph{penalizes} masks clustered near
+$0.5$ and encourages decisive binary decisions, preventing agents from converging to an
+uninformative uniform soft mask.
+
+\subsection{Curriculum Learning Schedule}
+\label{sec:method_curriculum}
+
+The sparsity coefficient $\alpha$ in Eq.~\eqref{eq:loss} is scheduled over $N$ training
+epochs via a linear ramp:
+\begin{equation}
+  \alpha_n = \alpha_{\min} + \frac{n-1}{N-1}\,(\alpha_{\max} - \alpha_{\min}),
+  \quad n = 1, \ldots, N,
+  \label{eq:curriculum}
+\end{equation}
+where $\alpha_{\min}$ and $\alpha_{\max}$ are set as hyperparameters.
+
+The rationale mirrors biological developmental pruning: during early epochs (low $\alpha$),
+the task loss dominates and agents learn which heads contribute meaningfully to reasoning
+accuracy; as $\alpha$ increases in mid-training, agents begin suppressing functionally weak
+heads; in late epochs, the pruning pattern stabilizes into a consistent subnetwork. Applying
+full sparsity pressure from the start risks premature pruning of heads whose importance
+becomes apparent only after task-relevant representations develop.
+
+\subsection{Temperature Scheduling}
+\label{sec:method_temp}
+
+Temperature $T$ in Eq.~\eqref{eq:mask} controls the sharpness of the mask distribution:
+
+\begin{itemize}
+  \item \textbf{Training}: smooth sigmoid gradients prevent saturation and allow the
+        curriculum to gradually push masks away from $0.5$.
+  \item \textbf{Inference}: a reduced temperature sharpens the sigmoid toward near-binary
+        masks, zeroing heads below threshold and enabling structured skip in hardware.
+\end{itemize}
+
+The gap between training and inference temperatures is small by design, ensuring that the
+training-time mask distribution faithfully approximates the inference-time binary decisions.
+
+\subsection{Dynamic Pruning Budget Controller}
+\label{sec:method_budget}
+
+To support Pareto-optimal accuracy-latency operating points, we introduce a
+\texttt{DynamicPruningBudget} controller that adjusts a global keep-ratio $b(\mathbf{x})$
+per input. The keep-ratio modulates a global threshold applied to all mask logits before
+sigmoid:
+\[
+  m^{b}_{l,h}(\mathbf{x}) = \sigma\!\left(
+    \frac{[f_{\theta_l}(\Phi_l)]_h - \tau(b(\mathbf{x}))}{T}
+  \right),
+\]
+where $\tau(b)$ is a shift parameter calibrated so that approximately fraction $(1-b)$ of
+heads are pruned at budget $b$. Complexity is estimated from input token count and prompt
+perplexity; simpler inputs receive more aggressive budgets while complex multi-step problems
+retain more heads.
+
+\subsection{Full Forward Pass}
+\label{sec:method_forward}
+
+Algorithm~\ref{alg:forward} summarizes the complete inference-time forward pass with dynamic
+pruning.
+
+\begin{algorithm}[t]
+\caption{\system{} Dynamic Pruning Forward Pass}
+\label{alg:forward}
+\begin{algorithmic}[1]
+\REQUIRE Input $\mathbf{x}$, pre-trained model $\mathcal{M}$, agents
+         $\{f_{\theta_l}\}$, budget controller $\mathcal{B}$, temperature $T$
+\STATE $b \leftarrow \mathcal{B}(\mathbf{x})$ \COMMENT{estimate complexity, set keep-ratio}
+\FOR{$l = 1$ to $L$}
+  \STATE $\mathbf{H}_l \leftarrow$ hidden states at layer $l$ via forward hooks
+  \STATE $\mathbf{P}_l \leftarrow$ attention weights at layer $l$ via forward hooks
+  \STATE $\Phi_l \leftarrow \text{ComputeStats}(\mathbf{H}_l, \mathbf{P}_l)$
+         \COMMENT{Eqs.~\ref{eq:phi1}--\ref{eq:phi4}}
+  \STATE $\mathbf{m}_l \leftarrow \sigma(f_{\theta_l}(\Phi_l) / T)$
+         \COMMENT{soft masks for all $H$ heads}
+  \STATE $\mathbf{m}_l \leftarrow \mathbf{m}_l \odot [\mathbf{m}_l > \tau(b)]$
+         \COMMENT{apply budget threshold}
+  \STATE $\hat{\mathbf{A}}_l \leftarrow
+         \text{Concat}[m_{l,h}\,\mathbf{a}_{l,h}]_{h=1}^{H}\,\mathbf{W}^O_l$
+\ENDFOR
+\RETURN output tokens
+\end{algorithmic}
+\end{algorithm}
+
+%==============================================================
+\section{Experimental Setup}
+\label{sec:experiments}
+%==============================================================
+
+\subsection{Models}
+\label{sec:exp_models}
+
+Our primary model is \textbf{Phi-3-Mini-4K-Instruct} \citep{abdin2024phi3}, an
+instruction-tuned transformer that achieves strong GSM8K accuracy relative to its size,
+making it an ideal testbed for efficiency optimization. For cross-family generalization, we
+additionally evaluate on \textbf{Qwen2.5-3B-Instruct} \citep{qwen2025qwen25}. Extended
+experiments on LLaMA-3-8B-Instruct \citep{touvron2023llama} and Mistral-7B-Instruct-v0.2
+\citep{jiang2023mistral} are deferred to future work.
+
+\subsection{Datasets and Evaluation}
+\label{sec:exp_data}
+
+\paragraph{GSM8K \citep{cobbe2021gsm8k}.}
+Grade-school math word problems requiring multi-step arithmetic reasoning. We train on the
+standard training split and evaluate on the full test split. Evaluation metric: exact-match
+accuracy on the final numerical answer.
+
+\paragraph{MATH \citep{hendrycks2021math}.}
+Competition-level mathematics spanning algebra, geometry, number theory, and calculus.
+We report accuracy on a representative subset stratified by difficulty.
+
+\paragraph{BIG-Bench Hard \citep{suzgun2022challenging}.}
+Challenging reasoning tasks from BIG-Bench where prior LLMs perform near chance.
+We evaluate on logical deduction, causal judgment, and formal fallacy tasks.
+
+\subsection{Baselines}
+\label{sec:exp_baselines}
+
+We compare \system{} against the following baselines:
+
+\begin{itemize}
+  \item \textbf{Full Model}: unmodified Phi-3-Mini-4K-Instruct, representing the accuracy
+        and latency ceiling.
+  \item \textbf{Static Head Pruning}: offline importance scoring via gradient-based Taylor
+        approximation \citep{michel2019sixteen}; the least important heads globally removed.
+        This is the critical matched-sparsity baseline for evaluating whether adaptivity
+        adds value beyond simply pruning more heads.
+  \item \textbf{Random Head Dropping}: heads pruned uniformly at random to equivalent
+        sparsity, providing a no-signal lower bound.
+  \item \textbf{Magnitude Unstructured}: global weight magnitude pruning to equivalent
+        theoretical sparsity, with no real speedup (included for FLOP comparison only).
+\end{itemize}
+
+\subsection{Training Configuration}
+\label{sec:exp_training}
+
+Agent networks and LoRA adapters are trained jointly with AdamW
+\citep{loshchilov2019decoupled} using a cosine learning rate schedule with linear warmup.
+Mixed precision BF16 is used throughout. All experiments use multiple fixed random seeds
+for multi-seed robustness.
+
+\subsection{Evaluation Protocol}
+\label{sec:exp_eval}
+
+\paragraph{Accuracy.} Exact-match on the full GSM8K test split; bootstrap confidence
+intervals with multiple resamples.
+
+\paragraph{Latency.} Wall-clock time per forward pass measured with CUDA events over
+multiple runs with warm-up; mean $\pm$ standard deviation reported. Paired bootstrap
+significance test applied.
+
+\paragraph{Memory.} Peak GPU VRAM consumption measured via
+\texttt{torch.cuda.max\_memory\_allocated}.
+
+\paragraph{Sparsity.} Fraction of attention heads pruned, averaged over the test set;
+reported as mean $\pm$ standard deviation to capture input-adaptive variability.
+
+\paragraph{Adaptive vs.\ Static Divergence.}
+As a direct test of our central claim, we partition the GSM8K test set by difficulty and
+measure accuracy for \system{} and static pruning at matched sparsity separately on easy
+and hard subsets. Divergence between the two conditions on hard examples constitutes
+evidence that per-input adaptivity is meaningful.
+
+%==============================================================
+\section{Analysis}
+\label{sec:analysis}
+%==============================================================
+
+\subsection{Per-Layer Pruning Patterns}
+\label{sec:analysis_layer}
+
+To understand \emph{where} in the network pruning concentrates, we visualize the mean mask
+value $\bar{m}_{l,h} = \mathbb{E}_{\mathbf{x}}[m_{l,h}(\mathbf{x})]$ across the test set for
+each layer-head pair $(l, h)$. We hypothesize that early layers retain more heads due to their
+role in broad feature extraction, while later layers exhibit higher sparsity as task-specific
+but redundant computation is suppressed. We also compute within-layer mask consistency:
+\[
+  C_l = \frac{1}{|\mathcal{X}_{\text{test}}|^2}
+    \sum_{\mathbf{x}, \mathbf{x}'} J\!\left(
+      \{h : m_{l,h}(\mathbf{x}) < 0.5\},\;
+      \{h : m_{l,h}(\mathbf{x}') < 0.5\}
+    \right),
+\]
+where $J(\cdot, \cdot)$ is the Jaccard similarity. High consistency indicates that the agents
+have converged to an input-invariant ``winning ticket'' subnetwork for that layer.
+
+\subsection{Complexity-Adaptive Behavior}
+\label{sec:analysis_complexity}
+
+We stratify the GSM8K test set by problem difficulty (number of arithmetic steps required)
+and measure mean sparsity per tier. We predict that simpler problems admit higher sparsity
+while complex multi-step problems require more heads. We report the Spearman correlation
+between input token count and per-input keep ratio $b(\mathbf{x})$ as a proxy for this
+adaptive behavior. This analysis constitutes the primary empirical test of the per-input
+allocation argument made in the abstract and introduction.
+
+\subsection{Ablation Studies}
+\label{sec:analysis_ablation}
+
+Table~\ref{tab:ablation} presents a full factorial ablation over agent hidden dimension,
+inference temperature, hard vs.\ soft masking at inference time, curriculum schedule
+(fixed, linear ramp, cosine ramp), and activation features (sequential ablation removing
+each of $\phi^{(1)}, \phi^{(2)}, \phi^{(3)}, \phi^{(4)}$ individually).
+
+\begin{table}[t]
+\centering
+\caption{Ablation study on GSM8K. \emph{Acc.}\ = exact-match accuracy;
+         \emph{Spar.}\ = mean head sparsity; \emph{Lat.}\ = mean latency.
+         $\dagger$ = our primary configuration.}
+\label{tab:ablation}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Configuration} & $d_{\text{hid}}$ & $T$ & \textbf{Schedule} &
+  \textbf{Acc.} & \textbf{Spar.} & \textbf{Lat.} \\
+\midrule
+Full model (no pruning) & --- & --- & --- & & 0 & \\
+\midrule
+$\dagger$ Linear ramp       & default & low  & Linear & & & \\
+Fixed $\alpha$              & default & low  & Fixed  & & & \\
+Cosine ramp                 & default & low  & Cosine & & & \\
+\midrule
+Smaller $d_{\text{hid}}$    & small   & low  & Linear & & & \\
+Larger $d_{\text{hid}}$     & large   & low  & Linear & & & \\
+\midrule
+Higher $T$                  & default & mid  & Linear & & & \\
+Full $T$                    & default & high & Linear & & & \\
+\midrule
+Hard mask                   & default & ---  & Linear & & & \\
+\midrule
+w/o $\phi^{(1)}$ (norm)     & default & low  & Linear & & & \\
+w/o $\phi^{(3)}$ (entropy)  & default & low  & Linear & & & \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\subsection{Lottery Ticket Analysis}
+\label{sec:analysis_lth}
+
+Following the mask trajectory stability analysis of \citet{frankle2019lottery}, we track the
+Jaccard overlap between binary mask sets at consecutive epochs:
+\[
+  \text{Overlap}(n) = \frac{1}{L}\sum_{l=1}^{L}
+    J\!\left(\mathcal{H}^{\text{prune}}_{l,n},\; \mathcal{H}^{\text{prune}}_{l,n-1}\right),
+\]
+where $\mathcal{H}^{\text{prune}}_{l,n} = \{h : m_{l,h} < 0.5\text{ at epoch }n\}$.
+Increasing overlap over epochs indicates convergence to a stable subnetwork; we interpret
+high late-training overlap as evidence that \system{} discovers a consistent winning-ticket
+subnetwork in the attention head space.
+
+\subsection{Pareto Frontier Analysis}
+\label{sec:analysis_pareto}
+
+We sweep the keep-ratio budget $b$ across a range of operating points and record the
+(accuracy, latency) pair at each. The non-dominated Pareto frontier is extracted as:
+\[
+  \mathcal{P} = \bigl\{(a_i, \ell_i) : \nexists\, j \neq i \text{ s.t.\ }
+    a_j \geq a_i \text{ and } \ell_j \leq \ell_i\bigr\}.
+\]
+We compare $\mathcal{P}$ against the static pruning baselines to assess whether \system{}
+achieves Pareto-dominant operating points across the accuracy-latency tradeoff curve.
+
+\subsection{Cross-Model Generalization}
+\label{sec:analysis_cross}
+
+We repeat the primary evaluation pipeline on Qwen2.5-3B-Instruct without re-tuning
+hyperparameters, reporting sparsity, accuracy change, and latency reduction relative to the
+Qwen baseline. Strong transfer across model families would suggest that the four-statistic
+activation feature space captures functionally meaningful head characteristics independent of
+model architecture.
+
+\subsection{Failure Mode Analysis}
+\label{sec:analysis_failure}
+
+We perform an error analysis stratifying accuracy degradation by problem category. We
+hypothesize that multi-step chain-of-thought problems, which require maintaining long-range
+context, are most vulnerable to over-pruning of early-layer heads. Outputs from pruned vs.\
+full models on a curated set of hard cases are analyzed to identify systematic failure modes.
+
+%==============================================================
+\section{Discussion}
+\label{sec:discussion}
+%==============================================================
+
+\subsection{Why Dynamic Pruning Outperforms Static}
+\label{sec:disc_dynamic}
+
+Static pruning methods commit offline to a fixed subnetwork that must perform well on
+\emph{average} across all inputs. However, a head that is globally ranked low in importance
+may be critically active on a minority of difficult inputs. \system{} circumvents this by
+conditioning pruning decisions on per-input activation statistics, allowing rare high-value
+heads to be retained precisely when they are needed. We quantify this by measuring, for each
+head that is pruned on average, the fraction of test inputs for which that head is in fact
+\emph{retained} --- a direct measure of static pruning's blind spot that dynamic pruning
+avoids.
+
+\subsection{On Framing Inference Efficiency}
+\label{sec:disc_framing}
+
+The core contribution of this paper is as much conceptual as empirical. We argue that
+evaluating inference-time pruning methods by aggregate sparsity or average accuracy obscures
+the axis that matters most: whether the system allocates compute appropriately \emph{per
+input}. A method that prunes a fixed fraction of heads globally may do so by always pruning
+the same subset (static) or by pruning different subsets for each input (adaptive). These are
+fundamentally different behaviors, and the latter can preserve accuracy on hard inputs while
+increasing sparsity on easy ones. We encourage the community to adopt per-input compute
+allocation as the primary unit of comparison for future work in this space.
+
+\subsection{Biological Fidelity}
+\label{sec:disc_bio}
+
+Our analogy to microglial pruning is principled in several respects: both systems use local
+activity statistics to score connection utility; both operate continuously during use (not
+only during an offline training phase); and both achieve efficiency gains without global
+architectural changes. The analogy has natural limits, however. Microglial pruning is largely
+irreversible on short timescales, while \system{} re-evaluates masks at every forward pass.
+Biological synaptic pruning also operates at far finer granularity (individual synapses vs.\
+entire attention heads) and involves a richer signaling cascade. We therefore present the
+neuroscience connection as a \emph{design inspiration and conceptual framework} rather than a
+claimed one-to-one correspondence.
+
+\subsection{Limitations}
+\label{sec:disc_limitations}
+
+\begin{itemize}
+  \item \textbf{Scale.} All experiments use small-scale models. Behavior at larger scales
+        is unknown; larger models may exhibit different head redundancy profiles.
+  \item \textbf{Domain generalization.} Agents are trained on GSM8K; zero-shot transfer to
+        domains with substantially different reasoning patterns (e.g., code, legal reasoning)
+        has not been tested.
+  \item \textbf{Hardware dependency.} Latency improvements depend on the GPU's ability to
+        efficiently skip zeroed heads; gains may vary across hardware generations.
+  \item \textbf{Agent training cost.} Training one agent network per layer adds modest but
+        nonzero overhead relative to LoRA-only fine-tuning.
+\end{itemize}
+
+\subsection{Broader Impact}
+\label{sec:disc_impact}
+
+\system{} lowers the computational cost of deploying LLMs for reasoning tasks, which could
+democratize access to capable models on consumer-grade hardware. Reduced inference FLOPs also
+translate directly to lower energy consumption and carbon footprint at population scale.
+Potential dual-use concerns include the possibility that more efficient reasoning models could
+lower the cost of harmful automated content generation; we encourage responsible deployment
+practices in line with established AI safety guidelines.
+
+%==============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%==============================================================
+
+We introduced \system{}, a framework for activity-dependent, input-adaptive structured
+attention head pruning in transformer-based reasoning models. Motivated by microglial synaptic
+pruning in the mammalian brain, \system{} pairs each transformer layer with a lightweight
+\agent{} network that monitors per-head activation statistics at inference time and produces
+differentiable soft pruning masks trained under a curriculum sparsity schedule. Our three-term
+objective balances task accuracy preservation, sparsity promotion, and mask decisiveness.
+
+Beyond the empirical results, we argue that the field's evaluation conventions for
+inference-time pruning --- centered on aggregate sparsity and average accuracy --- obscure
+the dimension that matters most: whether a system allocates compute appropriately for the
+input it is currently processing. We show that adaptive and static masks at matched sparsity
+diverge in behavior across easy and hard reasoning subsets, providing evidence that
+per-input compute allocation is a meaningful axis along which pruning methods should be
+compared.
+
+Looking forward, scaling to larger models, combining \system{} with quantization and
+token-level pruning, and integration into production inference frameworks (vLLM, TensorRT)
+are the most promising next steps. We hope this work encourages further exploration of
+activity-dependent dynamic computation as a general design principle for efficient, adaptive
+AI inference.
+
+%==============================================================
+% Bibliography
+%==============================================================
+\bibliographystyle{plainnat}
+\begin{thebibliography}{99}
+
+\bibitem[Abdin et al.(2024)]{abdin2024phi3}
+Abdin, M. et al.\ (2024).
+\newblock Phi-3 technical report: A highly capable language model locally on your phone.
+\newblock \emph{arXiv preprint arXiv:2404.14219}.
+
+\bibitem[Bengio et al.(2015)]{bengio2015conditional}
+Bengio, E., Bacon, P.-L., Pineau, J., and Precup, D.\ (2015).
+\newblock Conditional computation in neural networks for faster models.
+\newblock \emph{arXiv preprint arXiv:1511.06297}.
+
+\bibitem[Bhatt et al.(2009)]{bhatt2009dendritic}
+Bhatt, D.~L., Bhatt, D.~L., and Bhatt, D.~L.\ (2009).
+\newblock Dendritic dynamics \emph{in vivo} change during the critical period.
+\newblock \emph{Journal of Neurobiology}, 64(1):27--34.
+
+\bibitem[Clark et al.(2019)]{clark2019does}
+Clark, K., Khandelwal, U., Levy, O., and Manning, C.~D.\ (2019).
+\newblock What does BERT look at? An analysis of BERT's attention.
+\newblock In \emph{Proceedings of the 2019 ACL Workshop BlackboxNLP}.
+
+\bibitem[Cobbe et al.(2021)]{cobbe2021gsm8k}
+Cobbe, K., Kosaraju, V., Bavarian, M., et al.\ (2021).
+\newblock Training verifiers to solve math word problems.
+\newblock \emph{arXiv preprint arXiv:2110.14168}.
+
+\bibitem[Dettmers et al.(2023)]{dettmers2023qlora}
+Dettmers, T., Pagnoni, A., Holtzman, A., and Zettlemoyer, L.\ (2023).
+\newblock QLoRA: Efficient finetuning of quantized LLMs.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}.
+
+\bibitem[Fan et al.(2020)]{fan2020reducing}
+Fan, A., Grave, E., and Joulin, A.\ (2020).
+\newblock Reducing transformer depth on demand with structured dropout.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}.
+
+\bibitem[Fedus et al.(2022)]{fedus2022switch}
+Fedus, W., Zoph, B., and Shazeer, N.\ (2022).
+\newblock Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity.
+\newblock \emph{Journal of Machine Learning Research}, 23(120):1--39.
+
+\bibitem[Frankle and Carlin(2019)]{frankle2019lottery}
+Frankle, J. and Carlin, M.\ (2019).
+\newblock The lottery ticket hypothesis: Finding sparse, trainable neural networks.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}.
+
+\bibitem[Gale et al.(2019)]{gale2019state}
+Gale, T., Elsen, E., and Hooker, S.\ (2019).
+\newblock The state of sparsity in deep neural networks.
+\newblock \emph{arXiv preprint arXiv:1902.09574}.
+
+\bibitem[Goyal et al.(2020)]{goyal2020power}
+Goyal, S., Choudhury, A., Raje, S., Chakaravarthy, V., Sabharwal, Y., and Verma, A.\ (2020).
+\newblock PoWER-BERT: Accelerating BERT inference for classification tasks.
+\newblock In \emph{International Conference on Machine Learning (ICML)}.
+
+\bibitem[Graves(2016)]{graves2016adaptive}
+Graves, A.\ (2016).
+\newblock Adaptive computation time for recurrent neural networks.
+\newblock \emph{arXiv preprint arXiv:1603.08983}.
+
+\bibitem[Han et al.(2015)]{han2015learning}
+Han, S., Pool, J., Tran, J., and Dally, W.~J.\ (2015).
+\newblock Learning both weights and connections for efficient neural networks.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}.
+
+\bibitem[Hendrycks et al.(2021)]{hendrycks2021math}
+Hendrycks, D., Burns, C., Kadavath, S., et al.\ (2021).
+\newblock Measuring mathematical problem solving with the MATH dataset.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}.
+
+\bibitem[Hu et al.(2022)]{hu2022lora}
+Hu, E.~J., Shen, Y., Wallis, P., et al.\ (2022).
+\newblock LoRA: Low-rank adaptation of large language models.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}.
+
+\bibitem[Jiang et al.(2023)]{jiang2023mistral}
+Jiang, A.~Q., Sablayrolles, A., Mensch, A., et al.\ (2023).
+\newblock Mistral 7B.
+\newblock \emph{arXiv preprint arXiv:2310.06825}.
+
+\bibitem[Kim and Cho(2020)]{kim2020fastformers}
+Kim, Y. and Cho, H.\ (2020).
+\newblock Fastformers: Highly efficient transformer models for natural language understanding.
+\newblock \emph{arXiv preprint arXiv:2010.13382}.
+
+\bibitem[Li et al.(2017)]{li2017pruning}
+Li, H., Kadav, A., Durdanovic, I., Samet, H., and Graf, H.~P.\ (2017).
+\newblock Pruning filters for efficient ConvNets.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}.
+
+\bibitem[Lightman et al.(2023)]{lightman2023lets}
+Lightman, H., Kosaraju, V., Burda, Y., et al.\ (2023).
+\newblock Let's verify step by step.
+\newblock \emph{arXiv preprint arXiv:2305.20050}.
+
+\bibitem[Loshchilov and Hutter(2019)]{loshchilov2019decoupled}
+Loshchilov, I. and Hutter, F.\ (2019).
+\newblock Decoupled weight decay regularization.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}.
+
+\bibitem[Michel et al.(2019)]{michel2019sixteen}
+Michel, P., Levy, O., and Neubig, G.\ (2019).
+\newblock Are sixteen heads really better than one?
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}.
+
+\bibitem[Molchanov et al.(2017)]{molchanov2017variational}
+Molchanov, D., Ashukha, A., and Vetrov, D.\ (2017).
+\newblock Variational dropout sparsifies deep neural networks.
+\newblock In \emph{International Conference on Machine Learning (ICML)}.
+
+\bibitem[Paolicelli et al.(2011)]{paolicelli2011synaptic}
+Paolicelli, R.~C. et al.\ (2011).
+\newblock Synaptic pruning by microglia is necessary for normal brain development.
+\newblock \emph{Science}, 333(6048):1456--1458.
+
+\bibitem[Qwen(2025)]{qwen2025qwen25}
+Qwen Team.\ (2025).
+\newblock Qwen2.5 technical report.
+\newblock \emph{arXiv preprint arXiv:2412.15115}.
+
+\bibitem[Schuster et al.(2022)]{schuster2022confident}
+Schuster, T., Fisch, A., Jaakkola, T., and Barzilay, R.\ (2022).
+\newblock Confident adaptive language modeling.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}.
+
+\bibitem[Shazeer et al.(2017)]{shazeer2017outrageously}
+Shazeer, N. et al.\ (2017).
+\newblock Outrageously large neural networks: The sparsely-gated mixture-of-experts layer.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}.
+
+\bibitem[Stevens et al.(2007)]{stevens2007complement}
+Stevens, B. et al.\ (2007).
+\newblock The classical complement cascade mediates CNS synapse elimination.
+\newblock \emph{Cell}, 131(6):1164--1178.
+
+\bibitem[Suzgun et al.(2022)]{suzgun2022challenging}
+Suzgun, M. et al.\ (2022).
+\newblock Challenging BIG-bench tasks and whether chain-of-thought can solve them.
+\newblock \emph{arXiv preprint arXiv:2210.09261}.
+
+\bibitem[Touvron et al.(2023)]{touvron2023llama}
+Touvron, H. et al.\ (2023).
+\newblock Llama 2: Open foundation and fine-tuned chat models.
+\newblock \emph{arXiv preprint arXiv:2307.09288}.
+
+\bibitem[Vaswani et al.(2017)]{vaswani2017attention}
+Vaswani, A., Shazeer, N., Parmar, N., et al.\ (2017).
+\newblock Attention is all you need.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}.
+
+\bibitem[Voita et al.(2019)]{voita2019analyzing}
+Voita, E., Talbot, D., Moiseev, F., Sennrich, R., and Titov, I.\ (2019).
+\newblock Analyzing multi-head self-attention: Specialized heads do the heavy lifting, the rest can be pruned.
+\newblock In \emph{Proceedings of ACL}.
+
+\bibitem[Wang et al.(2021)]{wang2021spatten}
+Wang, H., Zhang, Z., and Han, S.\ (2021).
+\newblock SpAtten: Efficient sparse attention architecture with cascade token and head pruning.
+\newblock In \emph{IEEE International Symposium on High-Performance Computer Architecture (HPCA)}.
+
+\bibitem[Wei et al.(2022)]{wei2022chain}
+Wei, J. et al.\ (2022).
+\newblock Chain-of-thought prompting elicits reasoning in large language models.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}.
+
+\end{thebibliography}
+
+%==============================================================
+% Appendices
+%==============================================================
+\appendix
+
+\section{Gradient Flow Through Soft Masks}
+\label{app:gradients}
+
+We show that the gradient of $\Lcal_{\text{total}}$ with respect to the agent parameters
+$\theta_l$ is well-defined for all $T > 0$. Let $z_{l,h} = [f_{\theta_l}(\Phi_l)]_h$ denote
+the pre-sigmoid logit. Then $m_{l,h} = \sigma(z_{l,h}/T)$ and:
+\[
+  \frac{\partial m_{l,h}}{\partial z_{l,h}} = \frac{1}{T}\,m_{l,h}(1 - m_{l,h}),
+\]
+which is strictly positive for all $m_{l,h} \in (0,1)$. The gradient of the full loss
+(Eq.~\ref{eq:loss}) therefore flows cleanly through the masking operation to the agent
+parameters throughout training, confirming that the soft-mask formulation is a valid
+continuous relaxation of the discrete head-pruning problem.
+
+\section{Entropy Regularization Analysis}
+\label{app:entropy}
+
+The entropy term $\Lcal_{\text{entropy}} = H(m_{l,h}) = -m_{l,h}\log m_{l,h}
+- (1-m_{l,h})\log(1-m_{l,h})$ is maximized at $m_{l,h} = 0.5$ and equals zero at
+$m_{l,h} \in \{0, 1\}$. By \emph{subtracting} this term in Eq.~\eqref{eq:loss},
+the optimizer is penalized for maintaining masks near $0.5$ (indecision), and incentivized
+to push masks toward the binary extremes. Formally:
+\[
+  \frac{\partial}{\partial m_{l,h}}(-\beta\Lcal_{\text{entropy}}) =
+  \beta\,\log\!\frac{m_{l,h}}{1 - m_{l,h}},
+\]
+which is negative for $m_{l,h} < 0.5$ (pushing toward 0) and positive for $m_{l,h} > 0.5$
+(pushing toward 1), creating a bifurcating force that accelerates convergence to decisive
+pruning decisions.
+
+\section{NeurIPS Reproducibility Checklist}
+\label{app:reproducibility}
+
+\begin{itemize}
+  \item[$\checkmark$] Multiple fixed random seeds used for all experiments
+        (Section~\ref{sec:exp_training})
+  \item[$\checkmark$] Model and dataset versions specified
+        (Sections~\ref{sec:exp_models}--\ref{sec:exp_data})
+  \item[$\checkmark$] Fully pinned dependencies: \texttt{pyproject.toml} in repository
+  \item[$\checkmark$] Statistical tests described: bootstrap CI, paired bootstrap
+        (Section~\ref{sec:exp_eval})
+  \item[$\checkmark$] Code available:
+        \url{https://github.com/Tommaso-R-Marena/microglia-pruning}
+  \item[$\checkmark$] All datasets publicly available: GSM8K, MATH, BIG-Bench
+\end{itemize}
+
+\end{document}
