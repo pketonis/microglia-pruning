@@ -1,8 +1,8 @@
 \documentclass{article}
 
-% NeurIPS 2026 main-track submission format.
+% NeurIPS 2026 Position Paper Track submission format.
 % Do not add "final" or "preprint" for an anonymized submission.
-\usepackage{neurips_2026}
+\usepackage[position]{neurips_2026}
 
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
@@ -17,7 +17,10 @@
 \usepackage{microtype}
 \usepackage{xcolor}
 
-\title{Microglia-Inspired Dynamic Pruning for Reasoning Models}
+\newcommand{\method}{\textsc{adapt}}
+
+\title{Static Sparsity Is the Wrong Unit of Evaluation for\\
+Inference-Time Attention Pruning}
 
 \author{%
   Anonymous Author(s) \\
@@ -31,56 +34,423 @@
 \maketitle
 
 \begin{abstract}
-  Replace this paragraph with a one-paragraph summary of the problem, method,
-  main empirical result, and scope of the contribution.
+Structured attention pruning is usually evaluated by aggregate sparsity and
+average task accuracy. This framing treats a pruned transformer as if its
+computational budget were a fixed property of the model rather than a decision
+made for each input. We argue that this is the wrong abstraction for reasoning
+workloads. A static pruning mask and an input-adaptive pruning policy can have
+the same average keep ratio while allocating compute in very different ways.
+The evaluation question should therefore shift from ``which heads can be
+removed globally?'' to ``does the system allocate attention heads appropriately
+for the input currently being processed?'' We support this position with a
+case study of activity-dependent attention pruning, \method{}, in which small
+learned agents produce per-input attention-head masks from runtime activation
+statistics. Across two full BIG-Bench Hard sweeps with Qwen3-4B at matched
+reported keep ratio, \method{} improves over a static mask by 9.9 and 9.5
+percentage points in mean task accuracy. These results do not establish a final
+benchmark claim, but they show that static and adaptive pruning are not
+interchangeable under aggregate sparsity. We propose that future work report
+per-input keep-ratio distributions, adaptive-static matched-sparsity gaps, and
+mask variability diagnostics alongside standard accuracy and latency.
 \end{abstract}
 
 \section{Introduction}
 
-State the problem, the proposed microglia-inspired dynamic pruning approach, and
-the main claims supported by the experiments.
+Transformer inference uses the same attention structure for every input. A
+short factual query, a simple arithmetic problem, and a long compositional
+reasoning prompt all activate every attention head in every layer. The standard
+response to this inefficiency is structured pruning: estimate which attention
+heads are globally redundant, remove or mask them, and evaluate the resulting
+model by its average sparsity and task accuracy
+\citep{michel2019sixteen,voita2019analyzing,clark2019does}.
 
-\section{Related work}
+That evaluation protocol is convenient, but it hides the most important
+decision made by an inference system: how much compute to spend on a particular
+input. A fixed pruning mask commits to the same subnetwork for all examples.
+An adaptive pruning policy can keep more capacity for hard inputs and suppress
+more capacity for easy ones. These two systems may have the same average
+sparsity, but they implement different computational policies.
 
-Summarize related work on transformer pruning, adaptive inference, sparse
-attention, and biologically inspired neural computation.
+This paper argues that aggregate sparsity is an insufficient unit of evaluation
+for inference-time pruning. The central object of study should be per-input
+compute allocation. In particular, pruning papers should not only report the
+mean fraction of heads kept; they should report how that fraction varies across
+examples, whether adaptivity changes behavior under matched sparsity, and
+which inputs benefit or suffer from dynamic allocation.
 
-\section{Method}
+Our position is motivated by reasoning workloads. In tasks such as symbolic
+deduction, mathematical word problems, and multi-step question answering, the
+computational demand of an input is not well captured by dataset identity alone.
+Even within a single benchmark, examples vary in the number of latent steps,
+the amount of context that must be maintained, and the degree to which
+intermediate facts must be combined. A globally fixed attention mask is a poor
+fit for that variation.
 
-Describe the activation statistics, microglia agents, masking mechanism, and
-training objective.
+We make three claims.
 
-\section{Experiments}
+\begin{enumerate}
+  \item Static attention pruning encodes a stronger assumption than is usually
+        acknowledged: it assumes head utility is stable enough across inputs
+        that one global mask is an adequate inference policy.
+  \item Matched average sparsity does not imply matched computation. Adaptive
+        and static masks can have the same mean keep ratio while preserving
+        different heads on different examples.
+  \item Evaluation protocols for efficient reasoning models should include
+        per-input allocation diagnostics, not only average sparsity, accuracy,
+        and latency.
+\end{enumerate}
 
-Describe models, datasets, baselines, matched sparsity controls, evaluation
-metrics, hardware, seeds, and statistical tests.
+We use \method{}, an activity-dependent pruning system, as a case study rather
+than as the sole contribution of the paper. \method{} pairs each transformer
+layer with a small learned agent that maps runtime activation statistics to
+head-level keep masks. The system is inspired by a simple biological principle:
+microglia refine neural circuits in response to local patterns of activity
+\citep{stevens2007complement,paolicelli2011synaptic}. We do not claim a
+one-to-one biological model. The useful abstraction is activity-dependent
+allocation: connections are evaluated in context, not only by a global
+importance score.
 
-\section{Results}
+\section{Position}
 
-Report accuracy, latency, sparsity, confidence intervals, ablations, and mask
-behavior analyses.
+The prevailing question in attention pruning is: which heads are dispensable?
+This question is underspecified. A head may be dispensable for most examples
+and still be useful for a minority of hard cases. Conversely, a head may be
+useful on average while contributing little to a large set of easy inputs. A
+single global answer collapses this variation.
+
+We propose a different question: which heads are necessary for this input? This
+question treats pruning as an inference-time allocation problem. It does not
+require that all pruning methods become dynamic, but it does require that
+dynamic behavior be measured directly when it is claimed. A model that keeps
+75\% of heads on average could keep exactly the same 75\% for every input, or
+it could keep 95\% for hard inputs and 55\% for easy ones. Reporting only the
+mean keep ratio makes these systems appear equivalent.
+
+This matters because efficiency is not a scalar property of a model alone. It
+is a property of a model, an input distribution, and an allocation policy. For
+reasoning models, the input distribution often contains a mixture of trivial,
+moderate, and difficult cases. A useful efficient system should exploit that
+mixture.
+
+\section{Why Static Masks Are Incomplete}
+
+Static pruning has clear advantages. It is simple, easy to deploy, and directly
+compatible with optimized kernels when heads are physically removed. It also
+has an attractive experimental protocol: compute an importance score for each
+head, prune the lowest-scoring heads, and measure the resulting accuracy and
+latency. This is a reasonable baseline.
+
+The limitation is that static pruning turns a distributional statistic into an
+input-level decision. Let $m_{l,h} \in \{0,1\}$ denote a static mask for head
+$h$ in layer $l$. Once chosen, $m_{l,h}$ is applied to every example. The mask
+therefore represents an average judgment about utility:
+\[
+  m_{l,h} = f\left(\mathbb{E}_{x \sim \mathcal{D}}[u_{l,h}(x)]\right),
+\]
+where $u_{l,h}(x)$ is an unobserved, input-dependent utility. If the variance
+of $u_{l,h}(x)$ is small, this approximation is acceptable. If the variance is
+large, a static mask can prune heads that are rarely but critically useful.
+
+Dynamic inference methods already recognize this issue in other forms.
+Conditional computation allocates model capacity as a function of the input
+\citep{bengio2015conditional}.
+Early-exit models allocate fewer layers to easy examples
+\citep{graves2016adaptive,schuster2022confident}. Token-pruning methods reduce
+sequence computation based on token salience
+\citep{goyal2020power,wang2021spatten}. Mixture-of-experts models route inputs
+through different feed-forward experts \citep{shazeer2017outrageously,fedus2022switch}.
+Head-level pruning should be evaluated with the same lens: the policy matters,
+not only the average number of active units.
+
+\section{An Evaluation Protocol for Adaptive Pruning}
+
+We recommend that pruning papers report four quantities when evaluating
+input-adaptive methods.
+
+\paragraph{Matched-sparsity adaptive-static gap.}
+Compare an adaptive policy against a static policy at the same average keep
+ratio. This is the primary test of whether adaptivity adds value beyond simply
+using more compute.
+
+\paragraph{Per-input keep-ratio distribution.}
+Report the distribution of keep ratios across examples, not just the mean. If a
+method claims to allocate compute dynamically, the distribution should show how
+budgets vary.
+
+\paragraph{Stratified performance.}
+Evaluate easy and hard subsets separately. A useful adaptive policy should not
+only improve average accuracy; it should reveal where additional compute is
+being spent and where it is being saved.
+
+\paragraph{Mask variability diagnostics.}
+Report whether masks vary across examples within a task and across tasks. Mean
+mask similarity alone is not sufficient. A high similarity between task-average
+masks can coexist with meaningful per-example variation, and a low similarity
+does not by itself prove improved allocation.
+
+These diagnostics should be treated as part of the empirical claim, not as
+optional interpretability figures. Without them, aggregate sparsity can obscure
+the behavior that adaptive pruning is meant to provide.
+
+\section{Case Study: Activity-Dependent Attention Pruning}
+
+To make the position concrete, we study \method{}, a simple input-adaptive
+attention-pruning framework. The goal is not to introduce a complex new
+architecture. The goal is to instantiate the evaluation problem in a way that
+allows static and adaptive policies to be compared under matched sparsity.
+
+Consider a transformer with $L$ layers and $H$ attention heads per layer. For
+an input $x$, \method{} predicts a soft keep mask
+$m_{l,h}(x) \in [0,1]$ for each head. The attention output at layer $l$ becomes
+\[
+  \hat{A}_l(x) =
+  \operatorname{Concat}\left[m_{l,1}(x)a_{l,1}, \ldots,
+  m_{l,H}(x)a_{l,H}\right] W_l^O,
+\]
+where $a_{l,h}$ is the output of head $h$ and $W_l^O$ is the output
+projection.
+
+Each layer has a small two-layer agent network. The agent receives activation
+statistics computed during the forward pass, including head activation
+magnitude and attention entropy. These features are inexpensive summaries of
+whether a head is sharply engaged, diffusely attending, or weakly active. The
+agent maps the layer-level feature vector to $H$ mask logits, which are passed
+through a temperature-scaled sigmoid.
+
+The training objective balances task fidelity and sparsity:
+\[
+  \mathcal{L} =
+  \mathcal{L}_{\text{task}} +
+  \alpha \mathcal{L}_{\text{sparse}} +
+  \beta \mathcal{L}_{\text{binary}}.
+\]
+The task loss preserves answer accuracy. The sparsity loss penalizes average
+mask value. The binary regularizer discourages indecisive masks near 0.5.
+During training, sparsity pressure is increased gradually so that agents first
+learn which heads support the task and only later learn to suppress weak heads.
+
+This system is intentionally modest. It is a probe of an evaluation thesis:
+when average keep ratio is held fixed, does an input-conditioned mask behave
+differently from a static mask?
+
+\section{Preliminary Evidence on BIG-Bench Hard}
+
+We ran two full BIG-Bench Hard sweeps \citep{suzgun2022challenging} using
+Qwen3-4B-Instruct-2507. Each sweep covered 27 BBH tasks with 25 examples per
+task. We compared three conditions: the unpruned model, a static head mask, and
+\method{}. Static and adaptive conditions were evaluated at a reported mean keep
+ratio of 0.75. The two sweeps used different random seeds.
+
+\begin{table}[t]
+  \centering
+  \caption{Mean task accuracy across 27 BIG-Bench Hard tasks. Each task uses
+  25 examples. The adaptive-static gap is computed after averaging task
+  accuracies within each run.}
+  \label{tab:bbh}
+  \begin{tabular}{lcccccc}
+    \toprule
+    Run & Seed & Unpruned & Static & \method{} & \method{} $-$ Static &
+    Tasks improved \\
+    \midrule
+    BBH sweep 1 & 42 & 0.339 & 0.201 & 0.301 & +0.099 & 17 / 27 \\
+    BBH sweep 2 & 43 & 0.339 & 0.098 & 0.193 & +0.095 & 14 / 27 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The result is not that \method{} closes the gap to the unpruned model. It does
+not. The result is that the adaptive policy consistently improves over the
+static policy under the same reported keep ratio. Across the two sweeps,
+\method{} improves mean task accuracy by 9.9 and 9.5 percentage points over
+static pruning.
+
+The task-level pattern is also informative. In one sweep, the largest gains
+appear on \texttt{salient\_translation\_error\_detection},
+\texttt{hyperbaton}, \texttt{causal\_judgement}, \texttt{navigate}, and
+\texttt{disambiguation\_qa}. These are not proof of a taxonomy, since each
+task has only 25 examples, but they illustrate why a single average can be
+misleading. Some tasks show large adaptive-static gaps; others show no
+difference; one task in the second sweep favors static pruning.
+
+The mask-similarity analysis is more cautionary. Mean adaptive masks across
+BBH tasks are highly similar under cosine similarity. This does not support a
+claim that \method{} learns a sharply different average mask for each task.
+Instead, the useful conclusion is narrower: adaptive pruning can outperform a
+static mask even when task-average masks appear similar. Future analysis should
+therefore focus on per-example variation, not only task-level average masks.
+
+These results are preliminary. They use two seeds and a small number of
+examples per task. They are nevertheless sufficient for the position advanced
+here: adaptive and static pruning should not be treated as equivalent merely
+because their aggregate keep ratios match.
+
+\section{What Would Falsify This Position?}
+
+A useful position paper should state what evidence would weaken its claim. Our
+argument would be undermined by any of the following findings.
+
+\begin{itemize}
+  \item Across many tasks, seeds, and model families, adaptive masks provide no
+        improvement over strong static masks at matched keep ratio.
+  \item Per-input keep ratios collapse to a constant, indicating that the
+        adaptive mechanism is dynamic in form but static in behavior.
+  \item Adaptive gains disappear when static masks are calibrated with stronger
+        importance estimates or larger calibration sets.
+  \item Reported adaptive gains are explained entirely by implementation
+        artifacts, such as mismatched sparsity accounting or different decoding
+        settings.
+\end{itemize}
+
+These are not minor concerns. They define the next experiments that should be
+run. A position in favor of per-input allocation does not exempt adaptive
+methods from strong static baselines.
+
+\section{Implications}
+
+If per-input allocation is the right object of study, several practices should
+change.
+
+First, matched-sparsity baselines should be standard. Adaptive methods should
+not be compared only to the full model or to weak random pruning. The right
+baseline is a carefully calibrated static mask with the same average keep
+ratio.
+
+Second, papers should report allocation behavior. Mean sparsity is not enough.
+Histograms of keep ratio, mask variance within tasks, and easy-hard
+stratification should be included whenever dynamic pruning is claimed.
+
+Third, latency claims should separate algorithmic sparsity from realized
+speedup. A dynamic mask that improves accuracy at a fixed compute budget is
+scientifically interesting even before it is fully optimized for hardware.
+Conversely, a method that reports sparsity without kernel-level speedup should
+be clear about that distinction.
+
+Fourth, adaptive pruning should be evaluated as a policy, not only as a
+compressed model. The policy decides where compute is spent. That decision is
+part of the method.
 
 \section{Limitations}
 
-Discuss limits of the empirical setting, model scale, datasets, compute budget,
-and assumptions behind the pruning mechanism.
+The empirical evidence here is intentionally modest. The BBH sweeps use 25
+examples per task and two seeds. This is enough to motivate the evaluation
+claim, but it is not enough to establish a definitive benchmark result.
 
-\begin{ack}
-Acknowledgments and funding disclosures are hidden during anonymous submission
-and appear only in final mode.
-\end{ack}
+The current case study also uses one model family. Larger models may exhibit
+different redundancy patterns, and stronger static pruning methods may reduce
+the observed adaptive-static gap. The static baseline must therefore be
+strengthened before making broad performance claims.
+
+The biological analogy should also be kept in perspective. Microglial pruning
+motivates the activity-dependent framing, but transformers do not implement
+synaptic pruning, complement signaling, or biological plasticity. The analogy
+is useful as a design principle, not as a mechanistic claim.
+
+Finally, adaptive masks create deployment challenges. Static pruning can be
+compiled into a smaller model. Dynamic pruning requires runtime decisions and
+hardware support to turn those decisions into latency gains. For this reason,
+accuracy at matched sparsity and realized speedup should be reported
+separately.
+
+\section{Conclusion}
+
+Attention pruning should not be evaluated only as a search for globally
+dispensable heads. For reasoning workloads, the more relevant question is how
+compute is allocated across inputs. A static mask and an adaptive policy can
+share the same average keep ratio while making different decisions on the
+examples that matter.
+
+Our case study provides preliminary evidence for this distinction. Across two
+full BIG-Bench Hard sweeps, an activity-dependent pruning policy improves over
+a static mask by roughly ten percentage points in mean task accuracy at matched
+reported keep ratio. The result is not a final claim of state-of-the-art
+efficiency. It is evidence that aggregate sparsity is too coarse to evaluate
+adaptive inference.
+
+Future work on pruning should report per-input allocation behavior alongside
+accuracy, sparsity, and latency. Without those diagnostics, the field risks
+treating very different inference policies as equivalent because their averages
+look the same.
 
 \section*{References}
 
 {\small
-Add references here or replace this section with BibTeX commands.
+\begin{thebibliography}{99}
+
+\bibitem[Bengio et al.(2015)]{bengio2015conditional}
+Bengio, E., Bacon, P.-L., Pineau, J., and Precup, D. (2015).
+\newblock Conditional computation in neural networks for faster models.
+\newblock \emph{arXiv preprint arXiv:1511.06297}.
+
+\bibitem[Clark et al.(2019)]{clark2019does}
+Clark, K., Khandelwal, U., Levy, O., and Manning, C. D. (2019).
+\newblock What does BERT look at? An analysis of BERT's attention.
+\newblock In \emph{Proceedings of the 2019 ACL Workshop BlackboxNLP}.
+
+\bibitem[Fedus et al.(2022)]{fedus2022switch}
+Fedus, W., Zoph, B., and Shazeer, N. (2022).
+\newblock Switch transformers: Scaling to trillion parameter models with
+simple and efficient sparsity.
+\newblock \emph{Journal of Machine Learning Research}, 23(120):1--39.
+
+\bibitem[Goyal et al.(2020)]{goyal2020power}
+Goyal, S., Choudhury, A., Raje, S., Chakaravarthy, V., Sabharwal, Y., and
+Verma, A. (2020).
+\newblock PoWER-BERT: Accelerating BERT inference for classification tasks.
+\newblock In \emph{International Conference on Machine Learning}.
+
+\bibitem[Graves(2016)]{graves2016adaptive}
+Graves, A. (2016).
+\newblock Adaptive computation time for recurrent neural networks.
+\newblock \emph{arXiv preprint arXiv:1603.08983}.
+
+\bibitem[Michel et al.(2019)]{michel2019sixteen}
+Michel, P., Levy, O., and Neubig, G. (2019).
+\newblock Are sixteen heads really better than one?
+\newblock In \emph{Advances in Neural Information Processing Systems}.
+
+\bibitem[Paolicelli et al.(2011)]{paolicelli2011synaptic}
+Paolicelli, R. C. et al. (2011).
+\newblock Synaptic pruning by microglia is necessary for normal brain
+development.
+\newblock \emph{Science}, 333(6048):1456--1458.
+
+\bibitem[Schuster et al.(2022)]{schuster2022confident}
+Schuster, T., Fisch, A., Jaakkola, T., and Barzilay, R. (2022).
+\newblock Confident adaptive language modeling.
+\newblock In \emph{Advances in Neural Information Processing Systems}.
+
+\bibitem[Shazeer et al.(2017)]{shazeer2017outrageously}
+Shazeer, N. et al. (2017).
+\newblock Outrageously large neural networks: The sparsely-gated
+mixture-of-experts layer.
+\newblock In \emph{International Conference on Learning Representations}.
+
+\bibitem[Stevens et al.(2007)]{stevens2007complement}
+Stevens, B. et al. (2007).
+\newblock The classical complement cascade mediates CNS synapse elimination.
+\newblock \emph{Cell}, 131(6):1164--1178.
+
+\bibitem[Suzgun et al.(2022)]{suzgun2022challenging}
+Suzgun, M. et al. (2022).
+\newblock Challenging BIG-bench tasks and whether chain-of-thought can solve
+them.
+\newblock \emph{arXiv preprint arXiv:2210.09261}.
+
+\bibitem[Voita et al.(2019)]{voita2019analyzing}
+Voita, E., Talbot, D., Moiseev, F., Sennrich, R., and Titov, I. (2019).
+\newblock Analyzing multi-head self-attention: Specialized heads do the heavy
+lifting, the rest can be pruned.
+\newblock In \emph{Proceedings of ACL}.
+
+\bibitem[Wang et al.(2021)]{wang2021spatten}
+Wang, H., Zhang, Z., and Han, S. (2021).
+\newblock SpAtten: Efficient sparse attention architecture with cascade token
+and head pruning.
+\newblock In \emph{IEEE International Symposium on High-Performance Computer
+Architecture}.
+
+\end{thebibliography}
 }
-
-\appendix
-
-\section{Technical appendix}
-
-Add supplementary experimental details, proofs, tables, or figures here.
 
 \newpage
 \input{checklist.tex}
