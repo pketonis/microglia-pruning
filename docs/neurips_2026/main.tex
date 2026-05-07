@@ -19,7 +19,7 @@
 
 \newcommand{\method}{\textsc{adapt}}
 
-\title{ADAPT: The Case for Input-Adaptive Attention Pruning at Inference Time}
+\title{Inference-Time Attention Pruning Should Be Input-Adaptive}
 
 \author{%
   Anonymous Author(s) \\
@@ -33,6 +33,8 @@
 \maketitle
 
 \begin{abstract}
+This position paper argues that inference-time attention pruning should be
+input-adaptive rather than static.
 Structured pruning of attention heads in large language models is usually
 treated as a static problem: a sparsity mask is computed once and reused for
 every input. We argue that this assumption is too restrictive for reasoning
@@ -63,6 +65,10 @@ globally sparse model.
 \end{abstract}
 
 \section{Introduction}
+
+\textbf{Position: inference-time attention pruning should be input-adaptive
+rather than static, and it should be evaluated as a per-input compute
+allocation policy.}
 
 Transformer inference uses the same attention structure for every input. A
 short factual query, a simple arithmetic problem, and a long compositional
@@ -311,6 +317,27 @@ These are not minor concerns. They define the next experiments that should be
 run. A position in favor of per-input allocation does not exempt adaptive
 methods from strong static baselines.
 
+\section{Alternative Views}
+
+The strongest alternative view is that static pruning should remain the default
+because it is simpler, easier to compile, and more likely to yield real latency
+improvements on current hardware. A fixed mask can be folded into the model
+once, while an adaptive policy requires runtime decisions and implementation
+support to convert masks into speedup. This is a serious objection. It means
+that adaptive pruning must be evaluated separately on scientific value and
+deployment value: first, whether input-conditioned masks improve accuracy at
+matched keep ratio; second, whether the resulting policy can be implemented
+efficiently enough to matter in production.
+
+A second alternative view is that stronger static calibration may close the
+gap. If a static mask is estimated from more examples, better importance
+scores, or task-specific calibration data, adaptive pruning may offer less
+benefit. We agree that adaptive methods should be compared against strong
+static baselines. Our claim is not that every adaptive mask will beat every
+static mask. The claim is that static and adaptive pruning are different
+inference policies, and aggregate sparsity alone is not enough to evaluate
+them.
+
 \section{Implications}
 
 If per-input allocation is the right object of study, several practices should
@@ -457,8 +484,5 @@ Architecture}.
 
 \end{thebibliography}
 }
-
-\newpage
-\input{checklist.tex}
 
 \end{document}
