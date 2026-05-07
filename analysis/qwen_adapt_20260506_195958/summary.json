@@ -1,0 +1,25 @@
+{
+  "run_dir": "/Users/pketonis/Downloads/qwen_adapt_20260506_195958",
+  "bbh": {
+    "groups": 27,
+    "mean_adapt_minus_static": 0.09925925925925926,
+    "mean_adapt_minus_static_ci_low": 0.03851851851851852,
+    "mean_adapt_minus_static_ci_high": 0.16592592592592592,
+    "adapt_wins": 17,
+    "ties": 5,
+    "static_wins": 5,
+    "max_gain": 0.56,
+    "max_loss": -0.24000000000000002
+  },
+  "math": {
+    "groups": 5,
+    "mean_adapt_minus_static": 0.024,
+    "mean_adapt_minus_static_ci_low": 0.008,
+    "mean_adapt_minus_static_ci_high": 0.04,
+    "adapt_wins": 3,
+    "ties": 2,
+    "static_wins": 0,
+    "max_gain": 0.04,
+    "max_loss": 0.0
+  }
+}
