@@ -34,24 +34,33 @@ Inference-Time Attention Pruning}
 \maketitle
 
 \begin{abstract}
-Structured attention pruning is usually evaluated by aggregate sparsity and
-average task accuracy. This framing treats a pruned transformer as if its
-computational budget were a fixed property of the model rather than a decision
-made for each input. We argue that this is the wrong abstraction for reasoning
-workloads. A static pruning mask and an input-adaptive pruning policy can have
-the same average keep ratio while allocating compute in very different ways.
-The evaluation question should therefore shift from ``which heads can be
-removed globally?'' to ``does the system allocate attention heads appropriately
-for the input currently being processed?'' We support this position with a
-case study of activity-dependent attention pruning, \method{}, in which small
-learned agents produce per-input attention-head masks from runtime activation
-statistics. Across two full BIG-Bench Hard sweeps with Qwen3-4B at matched
-reported keep ratio, \method{} improves over a static mask by 9.9 and 9.5
-percentage points in mean task accuracy. These results do not establish a final
-benchmark claim, but they show that static and adaptive pruning are not
-interchangeable under aggregate sparsity. We propose that future work report
-per-input keep-ratio distributions, adaptive-static matched-sparsity gaps, and
-mask variability diagnostics alongside standard accuracy and latency.
+Structured pruning of attention heads in large language models is usually
+treated as a static problem: a sparsity mask is computed once and reused for
+every input. We argue that this assumption is too restrictive for reasoning
+models, where the computational role of an attention head can depend on the
+input being processed. The dominant paradigm asks which heads are dispensable
+in general. We argue instead that inference-time pruning should ask which heads
+are necessary for the current input.
+
+We propose input-adaptive attention pruning at inference time as the natural
+alternative to static head pruning. The motivating principle is
+activity-dependent allocation. Biological microglia refine neural circuits in
+response to local patterns of use rather than by applying a single global
+structural rule. Analogously, transformer pruning should condition its decisions
+on runtime activity, retaining capacity when an input recruits it and suppressing
+heads when it does not.
+
+To make this position concrete, we present \method{}
+(\textbf{A}ctivity-\textbf{D}ependent \textbf{A}ttention \textbf{P}runing at
+inference \textbf{T}ime), a framework in which each transformer layer is paired
+with a small learned agent that predicts head-level keep masks from runtime
+activation statistics. Across two full BIG-Bench Hard sweeps with Qwen3-4B at
+matched reported keep ratio, \method{} improves over a static mask by 9.9 and
+9.5 percentage points in mean task accuracy. These results are preliminary, but
+they support the central position: adaptive and static pruning should not be
+treated as interchangeable under aggregate sparsity. Inference-time pruning
+should be evaluated as a per-input compute allocation policy, not only as a
+globally sparse model.
 \end{abstract}
 
 \section{Introduction}
@@ -64,19 +73,19 @@ heads are globally redundant, remove or mask them, and evaluate the resulting
 model by its average sparsity and task accuracy
 \citep{michel2019sixteen,voita2019analyzing,clark2019does}.
 
-That evaluation protocol is convenient, but it hides the most important
-decision made by an inference system: how much compute to spend on a particular
-input. A fixed pruning mask commits to the same subnetwork for all examples.
-An adaptive pruning policy can keep more capacity for hard inputs and suppress
-more capacity for easy ones. These two systems may have the same average
-sparsity, but they implement different computational policies.
+We argue that this static framing is the wrong default for inference-time
+pruning. A head that is weak on average may be useful on a difficult minority
+of examples. A head that is often useful may be unnecessary for many easy
+inputs. The relevant decision is therefore not simply which heads can be
+removed once and for all, but which heads should be kept for the input currently
+being processed.
 
-This paper argues that aggregate sparsity is an insufficient unit of evaluation
-for inference-time pruning. The central object of study should be per-input
-compute allocation. In particular, pruning papers should not only report the
-mean fraction of heads kept; they should report how that fraction varies across
-examples, whether adaptivity changes behavior under matched sparsity, and
-which inputs benefit or suffer from dynamic allocation.
+This paper proposes input-adaptive attention pruning as the right abstraction
+for reasoning models. In this view, a pruned model is not just a smaller
+network; it is an allocation policy. The policy decides how much attention
+capacity to spend on each input. A static mask and an adaptive mask can have
+the same average keep ratio, but they make different decisions and should be
+evaluated as different inference policies.
 
 Our position is motivated by reasoning workloads. In tasks such as symbolic
 deduction, mathematical word problems, and multi-step question answering, the
@@ -86,29 +95,27 @@ the amount of context that must be maintained, and the degree to which
 intermediate facts must be combined. A globally fixed attention mask is a poor
 fit for that variation.
 
-We make three claims.
+Our position has three parts.
 
 \begin{enumerate}
+  \item Attention pruning for reasoning models should be activity-dependent at
+        inference time, conditioned on what each input actually recruits.
   \item Static attention pruning encodes a stronger assumption than is usually
-        acknowledged: it assumes head utility is stable enough across inputs
-        that one global mask is an adequate inference policy.
-  \item Matched average sparsity does not imply matched computation. Adaptive
-        and static masks can have the same mean keep ratio while preserving
-        different heads on different examples.
+        acknowledged: it assumes one global mask is an adequate policy for all
+        inputs.
   \item Evaluation protocols for efficient reasoning models should include
-        per-input allocation diagnostics, not only average sparsity, accuracy,
-        and latency.
+        adaptive-static matched-sparsity comparisons and per-input allocation
+        diagnostics, not only average sparsity, accuracy, and latency.
 \end{enumerate}
 
-We use \method{}, an activity-dependent pruning system, as a case study rather
-than as the sole contribution of the paper. \method{} pairs each transformer
-layer with a small learned agent that maps runtime activation statistics to
-head-level keep masks. The system is inspired by a simple biological principle:
-microglia refine neural circuits in response to local patterns of activity
+We instantiate this position with \method{}, an activity-dependent pruning
+system. \method{} pairs each transformer layer with a small learned agent that
+maps runtime activation statistics to head-level keep masks. The system is
+inspired by a simple biological principle: microglia refine neural circuits in
+response to local patterns of activity
 \citep{stevens2007complement,paolicelli2011synaptic}. We do not claim a
-one-to-one biological model. The useful abstraction is activity-dependent
-allocation: connections are evaluated in context, not only by a global
-importance score.
+one-to-one biological model. The useful abstraction is that pruning decisions
+are made in context, not only by a global importance score.
 
 \section{Position}
 
